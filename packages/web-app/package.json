@@ -1,0 +1,26 @@
+{
+  "name": "@glink/web-app",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "vue-tsc --noEmit && vite build",
+    "dev": "vite",
+    "typecheck": "vue-tsc --noEmit"
+  },
+  "dependencies": {
+    "@glink/protocol": "workspace:*",
+    "monaco-editor": "catalog:",
+    "vue": "catalog:",
+    "vuetify": "catalog:"
+  },
+  "devDependencies": {
+    "@glink/workflow": "workspace:*",
+    "@vitejs/plugin-vue": "catalog:",
+    "less": "catalog:",
+    "typescript": "catalog:",
+    "vite": "catalog:",
+    "vite-plugin-vuetify": "catalog:",
+    "vue-tsc": "catalog:"
+  }
+}

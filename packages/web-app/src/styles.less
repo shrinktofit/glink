@@ -1,0 +1,36 @@
+@app-font: "Segoe UI", sans-serif;
+
+:root {
+  --surface: #fff;
+  --sidebar: #f7f7f8;
+  --divider: #dedfe2;
+  --text: #252a32;
+  --muted: #838891;
+  --hover: #eef0f3;
+  --selected: #dfe3e9;
+  --accent: #246bd4;
+  --error: #b42318;
+  --added: #168044;
+  --deleted: #cf3d47;
+  --modified: #b18300;
+  font-family: @app-font;
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+}
+
+body {
+  margin: 0;
+  min-width: 320px;
+  min-height: 100vh;
+}
+
+.v-application {
+  font-family: @app-font;
+}
+
+button { font: inherit; color: inherit; background: transparent; border: 0; cursor: pointer; }
+button:focus-visible, input:focus-visible, textarea:focus-visible { outline: 1px solid var(--accent); outline-offset: -1px; }
+.icon-button { width: 1.8em; height: 1.8em; color: var(--muted); flex-shrink: 0; }
+.icon-button:hover:not(:disabled) { color: var(--text); background: var(--hover); }
+.v-tab { min-width: 4em; padding: 0 .8em; font-size: .8125rem; text-transform: none; letter-spacing: 0; }

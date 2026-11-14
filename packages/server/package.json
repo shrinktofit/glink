@@ -1,0 +1,23 @@
+{
+  "name": "@glink/server",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "vite build && tsc -b --force",
+    "dev": "node --watch src/main.ts",
+    "start": "node lib/main.js",
+    "typecheck": "tsc --noEmit && tsc --project test/tsconfig.json",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@glink/protocol": "workspace:*"
+  },
+  "devDependencies": {
+    "@glink/workflow": "workspace:*",
+    "@types/node": "catalog:",
+    "typescript": "catalog:",
+    "vite": "catalog:",
+    "vitest": "catalog:"
+  }
+}

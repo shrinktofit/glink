@@ -1,0 +1,14 @@
+{
+  "extends": "@glink/workflow/tsconfig/basic",
+  "include": [
+    "../src",
+    "."
+  ],
+  "compilerOptions": {
+    "noEmit": true,
+    "allowImportingTsExtensions": true,
+    "types": [
+      "node"
+    ]
+  }
+}

@@ -1,0 +1,19 @@
+{
+  "name": "@glink/protocol",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    "./health": "./lib/health.js",
+    "./git": "./lib/git.js"
+  },
+  "scripts": {
+    "build": "vite build && tsc -b --force",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@glink/workflow": "workspace:*",
+    "typescript": "catalog:",
+    "vite": "catalog:"
+  }
+}

@@ -1,0 +1,26 @@
+{
+  "name": "glink",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=26"
+  },
+  "packageManager": "pnpm@10.33.0",
+  "scripts": {
+    "build": "turbo run build",
+    "dev": "turbo watch dev",
+    "test": "turbo run test",
+    "typecheck": "turbo run typecheck && tsc --noEmit",
+    "lint": "eslint . --max-warnings=0"
+  },
+  "devDependencies": {
+    "@glink/workflow": "workspace:*",
+    "@shrinktofit/eslint-config": "^0.0.19",
+    "@types/node": "catalog:",
+    "eslint": "^10.9.0",
+    "globals": "^17.14.0",
+    "turbo": "^2.9.12",
+    "typescript": "catalog:"
+  }
+}
