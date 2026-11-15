@@ -11,17 +11,28 @@ import {
   type GitFileChange,
   type WorktreeStatus,
 } from '@glink/protocol/git';
+import { GitIndexLockedError } from './git-index-locked-error.ts';
+import { GitSubmoduleDirtyError } from './git-submodule-dirty-error.ts';
 
 const execFileAsync = promisify(execFile);
 
 async function runGit(repoPath: string, args: string[]) {
-  const { stdout } = await execFileAsync('git', ['-C', repoPath, ...args], {
-    encoding: 'utf8',
-    maxBuffer: 16 * 1024 * 1024,
-    windowsHide: true,
-    env: { ...process.env, GIT_LITERAL_PATHSPECS: '1' },
-  });
-  return stdout;
+  try {
+    const { stdout } = await execFileAsync('git', ['-C', repoPath, ...args], {
+      encoding: 'utf8',
+      maxBuffer: 16 * 1024 * 1024,
+      windowsHide: true,
+      env: { ...process.env, GIT_LITERAL_PATHSPECS: '1', GIT_OPTIONAL_LOCKS: '0' },
+    });
+    return stdout;
+  } catch (error: unknown) {
+    const stderr = (error as { stderr?: string }).stderr;
+    const lock = stderr?.match(/Unable to create '(.+index\.lock)': File exists\./);
+    if (lock) {
+      throw new GitIndexLockedError(lock[1]);
+    }
+    throw error;
+  }
 }
 
 export async function readWorktreeStatus(repoPath: string): Promise<WorktreeStatus> {
@@ -30,6 +41,7 @@ export async function readWorktreeStatus(repoPath: string): Promise<WorktreeStat
     '--porcelain=v1',
     '-z',
     '--untracked-files=all',
+    '--ignore-submodules=none',
   ]);
   const entries = output.split('\0');
   const status: WorktreeStatus = { staged: [], unstaged: [] };
@@ -67,7 +79,60 @@ export async function readWorktreeStatus(repoPath: string): Promise<WorktreeStat
   if (head) {
     status.headMessage = head.trimEnd();
   }
+  const [unstagedLinks, stagedLinks] = await Promise.all([
+    status.unstaged.length ? readChangedSubmodules(repoPath, false) : [],
+    status.staged.length ? readChangedSubmodules(repoPath, true) : [],
+  ]);
+  const dirty = new Map<string, string>();
+  await Promise.all([...new Set([...unstagedLinks, ...stagedLinks])]
+    .map(async (path) => {
+      const child = join(repoPath, path);
+      try {
+        await lstat(join(child, '.git'));
+      } catch (error: unknown) {
+        if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
+          return; // An uninitialized or removed submodule has no working copy to inspect.
+        }
+        throw error;
+      }
+      if (await runGit(child, [
+        'status',
+        '--porcelain=v1',
+        '-z',
+        '--untracked-files=all',
+        '--ignore-submodules=none',
+      ])) {
+        dirty.set(path, `子模块 ${path} 有未提交的修改，不能暂存、提交或修订其指针。`);
+      }
+    }));
+  for (const file of status.unstaged) {
+    file.stageBlockedReason = dirty.get(file.path);
+  }
+  status.commitBlockedReason = stagedLinks.map((path) => dirty.get(path)).find(Boolean);
+  // An unchanged pointer already in HEAD does not prevent amending other files or the message.
+  status.amendBlockedReason = status.commitBlockedReason;
   return status;
+}
+
+async function readChangedSubmodules(repoPath: string, staged: boolean) {
+  const output = await runGit(repoPath, [
+    'diff',
+    ...(staged ? ['--cached'] : []),
+    '--raw',
+    '--no-renames',
+    '-z',
+    '--ignore-submodules=none',
+    '--',
+  ]);
+  const entries = output.split('\0');
+  const paths: string[] = [];
+  for (let index = 0; index < entries.length - 1; index += 2) {
+    const [oldMode, newMode] = entries[index].slice(1).split(' ');
+    if (oldMode === '160000' || newMode === '160000') {
+      paths.push(entries[index + 1]);
+    }
+  }
+  return paths;
 }
 
 async function readStoredFile(repoPath: string, path: string, index: boolean) {
@@ -146,6 +211,9 @@ export async function changeIndex(repoPath: string, path: string, action: GitInd
   }
   const paths = change.originalPath ? [change.path, change.originalPath] : [change.path];
   if (action === GitIndexAction.stage) {
+    if (change.stageBlockedReason) {
+      throw new GitSubmoduleDirtyError(change.stageBlockedReason);
+    }
     await runGit(repoPath, ['add', '--', ...paths]);
   } else if (status.headMessage !== undefined) {
     await runGit(repoPath, [
@@ -167,6 +235,11 @@ export async function changeIndex(repoPath: string, path: string, action: GitInd
 }
 
 export async function commitWorktree(repoPath: string, input: GitCommitInput) {
+  const status = await readWorktreeStatus(repoPath);
+  const blockedReason = input.amend ? status.amendBlockedReason : status.commitBlockedReason;
+  if (blockedReason) {
+    throw new GitSubmoduleDirtyError(blockedReason);
+  }
   await runGit(repoPath, [
     'commit',
     ...(input.amend ? ['--amend'] : []),

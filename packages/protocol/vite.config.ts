@@ -7,6 +7,7 @@ export default defineConfig({
       entry: {
         health: 'src/health.ts',
         git: 'src/git.ts',
+        workspace: 'src/workspace.ts',
       },
       formats: ['es'],
       fileName: (_format, entryName) => `${entryName}.js`,

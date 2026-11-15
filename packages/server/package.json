@@ -11,7 +11,8 @@
     "test": "vitest run"
   },
   "dependencies": {
-    "@glink/protocol": "workspace:*"
+    "@glink/protocol": "workspace:*",
+    "yaml": "catalog:"
   },
   "devDependencies": {
     "@glink/workflow": "workspace:*",

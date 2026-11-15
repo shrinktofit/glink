@@ -6,6 +6,7 @@ import DiffTree from '../diff-tree.vue';
 import SplitPane from '../split-pane.vue';
 import GitCommitInfo from './git-commit-info.vue';
 import GitFileDiff from './git-file-diff.vue';
+import GitCommitFilesView from './git-commit-files-view.vue';
 
 const props = defineProps<{ sha?: string }>();
 const repo = inject(gitRepoServiceKey);
@@ -21,6 +22,7 @@ const columns = ref(0.27);
 enum DetailTab {
   commit = 'commit',
   changes = 'changes',
+  files = 'files',
 }
 const tab = ref(DetailTab.changes);
 
@@ -83,6 +85,9 @@ watch([detail, selectedPath], async ([commit, path]) => {
       <v-tab :value="DetailTab.changes">
         Changes
       </v-tab>
+      <v-tab :value="DetailTab.files">
+        Files
+      </v-tab>
     </v-tabs>
     <p
       v-if="detailError"
@@ -101,7 +106,12 @@ watch([detail, selectedPath], async ([commit, path]) => {
           :commit="detail"
           compact
         />
+        <git-commit-files-view
+          v-if="tab === DetailTab.files"
+          :sha="detail.sha"
+        />
         <split-pane
+          v-else
           v-model="columns"
           class="commit-changes"
         >
@@ -110,6 +120,7 @@ watch([detail, selectedPath], async ([commit, path]) => {
               <diff-tree
                 v-model="selectedPath"
                 :items="detail.files"
+                :repo-path="repo.repoPath"
                 aria-label="Commit files"
               />
               <p

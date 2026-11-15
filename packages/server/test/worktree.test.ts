@@ -1,4 +1,5 @@
 import { execFile } from 'node:child_process';
+import { Buffer } from 'node:buffer';
 import { once } from 'node:events';
 import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { createServer } from 'node:http';
@@ -8,6 +9,8 @@ import { promisify } from 'node:util';
 import {
   commitDetailPath,
   commitDiffPath,
+  commitFilesPath,
+  commitFilePath,
   fileDiffPath,
   gitCommitPath,
   gitIndexPath,
@@ -17,6 +20,8 @@ import {
   type GitCommitDetail,
   type WorktreeStatus,
   type RepositoryOverview,
+  type GitCommitFilesResponse,
+  type GitCommitFileResponse,
 } from '@glink/protocol/git';
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import { handleRequest } from '../src/request-handler.ts';
@@ -300,6 +305,54 @@ describe('Worktree HTTP operations against real Git repositories', () => {
     });
     expect(await get<FileDiffResponse>(commitDiffPath, { sha, path: 'file.txt' }))
       .toEqual({ original: '', modified: 'original\n' });
+  });
+
+  it('browses full snapshots independently of newer commits and working files', async () => {
+    /// @case A commit includes unchanged text, a Unicode path, binary data and a submodule gitlink.
+    /// @expect Files lists the full tree and distinguishes text, binary and gitlink entries.
+    const initial = await git('rev-parse', 'HEAD');
+    await writeFile(join(repoPath, '文件 [1].txt'), 'snapshot\n');
+    await writeFile(join(repoPath, 'binary.dat'), Buffer.from([
+      0,
+      1,
+      2,
+      255,
+    ]));
+    await git('add', '--', '文件 [1].txt', 'binary.dat');
+    await git('update-index', '--add', '--cacheinfo', `160000,${initial},vendor/library`);
+    await git('commit', '-m', 'Snapshot');
+    const sha = await git('rev-parse', 'HEAD');
+    await git('rm', '--', '文件 [1].txt');
+    await writeFile(join(repoPath, 'file.txt'), 'newer\n');
+    await git('add', '--', 'file.txt');
+    await git('commit', '-m', 'Later changes');
+    await writeFile(join(repoPath, 'file.txt'), 'uncommitted\n');
+    const tree = await get<GitCommitFilesResponse>(commitFilesPath, { sha });
+    expect(tree.files.map((file) => file.path)).toEqual([
+      'binary.dat',
+      'file.txt',
+      'vendor/library',
+      '文件 [1].txt',
+    ]);
+    const detail = await get<GitCommitDetail>(commitDetailPath, { sha });
+    expect(detail.files.some((file) => file.path === 'file.txt')).toBe(false);
+    expect(await get<GitCommitFileResponse>(commitFilePath, { sha, path: 'file.txt' }))
+      .toEqual({ content: 'original\n', binary: false });
+    expect(await get<GitCommitFileResponse>(commitFilePath, { sha, path: '文件 [1].txt' }))
+      .toEqual({ content: 'snapshot\n', binary: false });
+    expect(await get<GitCommitFileResponse>(commitFilePath, { sha, path: 'binary.dat' }))
+      .toEqual({ content: '', binary: true });
+    expect(await get<GitCommitFileResponse>(commitFilePath, { sha, path: 'vendor/library' }))
+      .toEqual({ content: `Subproject commit ${initial}\n`, binary: false });
+    const newer = await get<GitCommitFilesResponse>(commitFilesPath,
+      { sha: await git('rev-parse', 'HEAD') });
+    expect(newer.files.some((file) => file.path === '文件 [1].txt')).toBe(false);
+    const missing = await fetch(`${origin}${commitFilePath}?${new URLSearchParams({
+      repoPath,
+      sha,
+      path: 'missing.txt',
+    })}`);
+    expect(missing.ok).toBe(false);
   });
 
   it('reads historical renames, additions, edits, and deletions across commits', async () => {

@@ -1,3 +1,8 @@
 import { App } from './app';
 
-new App();
+try {
+  await App.create();
+} catch (error: unknown) {
+  document.querySelector('#root')!.textContent
+    = error instanceof Error ? error.message : String(error);
+}

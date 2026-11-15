@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { onBeforeUnmount, onMounted, useTemplateRef, watch } from 'vue';
-import { editor } from 'monaco-editor/editor';
+import { diffLines } from 'diff';
+import { editor, Range } from 'monaco-editor/editor';
 import 'monaco-editor/features/diffEditor/register';
 import EditorWorker from 'monaco-editor/editor/editor.worker?worker';
 
@@ -11,6 +12,7 @@ const props = withDefaults(defineProps<{
 }>(), { language: 'plaintext' });
 const container = useTemplateRef<HTMLDivElement>('container');
 let diffEditor: editor.IStandaloneDiffEditor | undefined;
+let diffModel: editor.IDiffEditorViewModel | undefined;
 let originalModel: editor.ITextModel | undefined;
 let modifiedModel: editor.ITextModel | undefined;
 
@@ -25,7 +27,7 @@ onMounted(() => {
     renderSideBySide: true,
     useInlineViewWhenSpaceIsLimited: true,
     minimap: { enabled: false },
-    scrollBeyondLastLine: false,
+    scrollBeyondLastLine: true,
     hideUnchangedRegions: { enabled: true },
     fontSize: 12,
     renderOverviewRuler: false,
@@ -33,11 +35,50 @@ onMounted(() => {
   });
   originalModel = editor.createModel(props.original, props.language);
   modifiedModel = editor.createModel(props.modified, props.language);
-  diffEditor.setModel({ original: originalModel, modified: modifiedModel });
+  diffModel = diffEditor.createViewModel({ original: originalModel, modified: modifiedModel });
+  diffEditor.setModel(diffModel);
 });
 
-watch(() => props.original, (text) => originalModel?.setValue(text));
-watch(() => props.modified, (text) => modifiedModel?.setValue(text));
+function updateText(model: editor.ITextModel, text: string) {
+  const current = model.getValue();
+  if (current === text) {
+    return;
+  }
+  const changes = diffLines(current, text);
+  const edits: editor.IIdentifiedSingleEditOperation[] = [];
+  let offset = 0;
+  for (let index = 0; index < changes.length; index++) {
+    const change = changes[index];
+    if (!change.added && !change.removed) {
+      offset += change.value.length;
+      continue;
+    }
+    const start = model.getPositionAt(offset);
+    let replacement = '';
+    while (index < changes.length && (changes[index].added || changes[index].removed)) {
+      if (changes[index].removed) {
+        offset += changes[index].value.length;
+      } else {
+        replacement += changes[index].value;
+      }
+      index++;
+    }
+    index--;
+    edits.push({
+      range: Range.fromPositions(start, model.getPositionAt(offset)),
+      text: replacement,
+    });
+  }
+  // Preserve decorations so Monaco can track expanded regions and cursors across edits.
+  model.applyEdits(edits);
+}
+
+watch([() => props.original, () => props.modified], ([original, modified]) => {
+  if (originalModel && modifiedModel) {
+    updateText(originalModel, original);
+    updateText(modifiedModel, modified);
+  }
+});
 watch(() => props.language, (language) => {
   if (originalModel && modifiedModel) {
     editor.setModelLanguage(originalModel, language);
@@ -47,6 +88,7 @@ watch(() => props.language, (language) => {
 
 onBeforeUnmount(() => {
   diffEditor?.dispose();
+  diffModel?.dispose();
   originalModel?.dispose();
   modifiedModel?.dispose();
 });

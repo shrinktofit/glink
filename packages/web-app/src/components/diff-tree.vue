@@ -1,13 +1,34 @@
 <script setup lang="ts">
 import { GitDiffType, type GitFileChange } from '@glink/protocol/git';
+import { ref, watch } from 'vue';
 import FileTree from './file-tree.vue';
+import GitFileContextMenu from './git/git-file-context-menu.vue';
+defineOptions({ inheritAttrs: false });
 
-withDefaults(defineProps<{
+const props = withDefaults(defineProps<{
   items: readonly GitFileChange[];
+  repoPath: string;
   compactFolders?: boolean;
-}>(), { compactFolders: true });
+  disabledPaths?: readonly string[];
+}>(), { compactFolders: true, disabledPaths: () => [] });
 const selected = defineModel<string>();
-const emit = defineEmits<{ select: [item: GitFileChange] }>();
+const emit = defineEmits<{ select: [item: GitFileChange]; activate: [item: GitFileChange] }>();
+const context = ref<{ path: string; x: number; y: number }>();
+watch(() => props.disabledPaths, (paths) => {
+  if (context.value && paths.includes(context.value.path)) {
+    context.value = undefined;
+  }
+});
+
+function openMenu(event: MouseEvent, item: GitFileChange) {
+  event.preventDefault();
+  event.stopPropagation();
+  const bounds = (event.currentTarget as HTMLElement).getBoundingClientRect();
+  context.value = { path: item.path,
+    x: event.clientX || bounds.left,
+    y: event.clientY || bounds.bottom };
+}
+
 const markers: Record<GitDiffType, { icon: string; label: string; color: string }> = {
   [GitDiffType.added]: { icon: '+', label: 'Added', color: 'var(--added)' },
   [GitDiffType.untracked]: { icon: '+', label: 'Untracked', color: 'var(--added)' },
@@ -22,10 +43,14 @@ const markers: Record<GitDiffType, { icon: string; label: string; color: string 
 
 <template>
   <file-tree
+    v-bind="$attrs"
     v-model="selected"
     :items="items"
     :compact-folders="compactFolders"
+    :disabled-paths="disabledPaths"
     @select="emit('select', $event)"
+    @activate="emit('activate', $event)"
+    @contextmenu="openMenu"
   >
     <template #prefix="{ item }">
       <span
@@ -42,6 +67,14 @@ const markers: Record<GitDiffType, { icon: string; label: string; color: string 
       />
     </template>
   </file-tree>
+  <git-file-context-menu
+    v-if="context"
+    :path="context.path"
+    :repo-path="repoPath"
+    :x="context.x"
+    :y="context.y"
+    @close="context = undefined"
+  />
 </template>
 
 <style scoped lang="less">

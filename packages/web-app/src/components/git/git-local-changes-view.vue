@@ -15,6 +15,7 @@ import GitFileDiff from './git-file-diff.vue';
 defineProps<{
   status: WorktreeStatus;
   selected?: { file: GitFileChange; staged: boolean };
+  pendingPath?: string;
   diff?: FileDiffResponse;
   diffError?: string;
   error?: string;
@@ -50,6 +51,7 @@ const lists = ref(0.55);
             :items="status.unstaged"
             :staged="false"
             :selected-path="selected && !selected.staged ? selected.file.path : undefined"
+            :pending-path="pendingPath"
             :busy="busy"
             :loading="loading"
             @select="emit('select', $event, false)"
@@ -61,6 +63,7 @@ const lists = ref(0.55);
             :items="status.staged"
             staged
             :selected-path="selected?.staged ? selected.file.path : undefined"
+            :pending-path="pendingPath"
             :busy="busy"
             :loading="loading"
             @select="emit('select', $event, true)"
@@ -91,6 +94,8 @@ const lists = ref(0.55);
           :busy="busy"
           :has-staged-changes="!!status.staged.length && !loading"
           :previous-message="loading ? undefined : status.headMessage"
+          :commit-blocked-reason="status.commitBlockedReason"
+          :amend-blocked-reason="status.amendBlockedReason"
           @submit="emit('commit', $event)"
         />
       </div>

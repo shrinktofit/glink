@@ -2,6 +2,7 @@
 import { computed, ref } from 'vue';
 import type { GitReference, RepositoryOverview } from '@glink/protocol/git';
 import FileTree from '../file-tree.vue';
+import TreeDisclosure from '../tree-disclosure.vue';
 import { GitView } from './git-navigation';
 
 const props = defineProps<{
@@ -104,7 +105,7 @@ function selectReference(reference: GitReference) {
     </p>
     <div class="sections">
       <details open>
-        <summary>Worktrees <small>{{ worktrees.length }}</small></summary>
+        <summary><tree-disclosure />Worktrees <small>{{ worktrees.length }}</small></summary>
         <button
           v-for="worktree in worktrees"
           :key="worktree.path"
@@ -133,7 +134,7 @@ function selectReference(reference: GitReference) {
         </button>
       </details>
       <details open>
-        <summary>Branches <small>{{ branches.length }}</small></summary>
+        <summary><tree-disclosure />Branches <small>{{ branches.length }}</small></summary>
         <file-tree
           :items="branches"
           :compact-folders="false"
@@ -149,13 +150,14 @@ function selectReference(reference: GitReference) {
         </file-tree>
       </details>
       <details open>
-        <summary>Remotes <small>{{ remotes.length }}</small></summary>
+        <summary><tree-disclosure />Remotes <small>{{ remotes.length }}</small></summary>
         <details
           v-for="remote in remotes"
           :key="remote.name"
           class="remote"
         >
           <summary :title="remote.fetchUrl">
+            <tree-disclosure />
             {{ remote.name }}
           </summary>
           <file-tree
@@ -171,7 +173,7 @@ function selectReference(reference: GitReference) {
         </details>
       </details>
       <details>
-        <summary>Tags <small>{{ tags.length }}</small></summary>
+        <summary><tree-disclosure />Tags <small>{{ tags.length }}</small></summary>
         <file-tree
           :items="tags"
           :compact-folders="false"
@@ -184,7 +186,7 @@ function selectReference(reference: GitReference) {
         </file-tree>
       </details>
       <details open>
-        <summary>Stashes <small>{{ stashes.length }}</small></summary>
+        <summary><tree-disclosure />Stashes <small>{{ stashes.length }}</small></summary>
         <button
           v-for="stash in stashes"
           :key="stash.name"
@@ -196,7 +198,7 @@ function selectReference(reference: GitReference) {
         </button>
       </details>
       <details>
-        <summary>Submodules <small>{{ submodules.length }}</small></summary>
+        <summary><tree-disclosure />Submodules <small>{{ submodules.length }}</small></summary>
         <button
           v-for="submodule in submodules"
           :key="submodule.path"
@@ -252,15 +254,27 @@ header strong { min-width: 0;
   font: inherit;
   }
 .sections { flex: 1; min-height: 0; overflow: auto; padding: 0 .3em 1em; }
-summary { cursor: pointer; min-height: 1.8em; line-height: 1.8em; white-space: nowrap; }
+summary {
+  display: flex;
+  align-items: center;
+  gap: .5em;
+  cursor: pointer;
+  min-height: 1.8em;
+  line-height: 1.8em;
+  white-space: nowrap;
+  list-style: none;
+}
+summary::-webkit-details-marker { display: none; }
+details[open] > summary > .tree-disclosure { --disclosure-rotation: 90deg; }
+.sections :deep(.file-tree) { font-size: inherit; padding-left: .5em; }
 small { color: var(--muted); font-size: .85em; margin-left: .4em; }
 .remote { padding-left: 1em; }
 .nav-entry { display: flex;
   align-items: center;
-  gap: .4em;
+  gap: .5em;
   width: 100%;
   min-height: 1.8em;
-  padding: 0 .5em 0 1.5em;
+  padding: 0 .5em 0 1em;
   text-align: left;
   }
 .entry-name { flex: 1;

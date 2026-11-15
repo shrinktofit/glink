@@ -1,12 +1,14 @@
 <script setup lang="ts">
-import { computed } from 'vue';
+import { computed, inject } from 'vue';
 import { GitIndexAction, type GitFileChange } from '@glink/protocol/git';
 import DiffTree from '../diff-tree.vue';
+import { gitRepoServiceKey } from '../../git/git-repo-service';
 
 const props = defineProps<{
   items: GitFileChange[];
   staged: boolean;
   selectedPath?: string;
+  pendingPath?: string;
   busy: boolean;
   loading: boolean;
 }>();
@@ -15,6 +17,13 @@ const emit = defineEmits<{
   changeIndex: [file: GitFileChange, action: GitIndexAction];
 }>();
 const action = computed(() => props.staged ? GitIndexAction.unstage : GitIndexAction.stage);
+const repo = inject(gitRepoServiceKey)!;
+
+function changeIndex(file: GitFileChange) {
+  if (!props.busy && !props.loading && (props.staged || !file.stageBlockedReason)) {
+    emit('changeIndex', file, action.value);
+  }
+}
 </script>
 
 <template>
@@ -29,16 +38,19 @@ const action = computed(() => props.staged ? GitIndexAction.unstage : GitIndexAc
     <div class="tree-scroll">
       <diff-tree
         :items="items"
+        :repo-path="repo.repoPath"
         :model-value="selectedPath"
+        :disabled-paths="pendingPath ? [pendingPath] : undefined"
         @select="emit('select', $event)"
+        @activate="changeIndex"
       >
         <template #actions="{ item }">
           <button
             class="file-action"
             :aria-label="`${staged ? 'Unstage' : 'Stage'} ${item.path}`"
-            :title="staged ? 'Unstage' : 'Stage'"
-            :disabled="busy || loading"
-            @click="emit('changeIndex', item, action)"
+            :title="staged ? 'Unstage' : item.stageBlockedReason ?? 'Stage'"
+            :disabled="busy || loading || (!staged && !!item.stageBlockedReason)"
+            @click="changeIndex(item)"
           >
             {{ staged ? '−' : '+' }}
           </button>

@@ -3,6 +3,8 @@ import { Buffer } from 'node:buffer';
 import {
   commitDetailPath,
   commitDiffPath,
+  commitFilesPath,
+  commitFilePath,
   commitGraphLimit,
   commitGraphPath,
   fileDiffPath,
@@ -14,7 +16,14 @@ import {
 } from '@glink/protocol/git';
 import { readCommits } from './read-commits.ts';
 import { readRepositoryOverview } from './repository-overview.ts';
-import { readCommitDetail, readCommitDiff } from './commit-detail.ts';
+import {
+  readCommitDetail,
+  readCommitDiff,
+  readCommitFiles,
+  readCommitFileContent,
+} from './commit-detail.ts';
+import { GitIndexLockedError } from './git-index-locked-error.ts';
+import { GitSubmoduleDirtyError } from './git-submodule-dirty-error.ts';
 import { changeIndex, commitWorktree, readFileDiff, readWorktreeStatus } from './worktree.ts';
 
 function sendJson(response: ServerResponse, status: number, body: unknown) {
@@ -31,6 +40,8 @@ export async function handleGitRequest(
     fileDiffPath,
     commitDetailPath,
     commitDiffPath,
+    commitFilesPath,
+    commitFilePath,
     repositoryOverviewPath,
   ];
   const writeRoutes = [gitIndexPath, gitCommitPath];
@@ -78,7 +89,9 @@ export async function handleGitRequest(
       sendJson(response, 200, await readRepositoryOverview(repoPath));
       break;
     case commitDetailPath:
-    case commitDiffPath: {
+    case commitDiffPath:
+    case commitFilesPath:
+    case commitFilePath: {
       const sha = url.searchParams.get('sha');
       if (!sha || !/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/i.test(sha)) {
         sendJson(response, 400, { error: 'A full commit SHA is required.' });
@@ -86,13 +99,17 @@ export async function handleGitRequest(
       }
       if (url.pathname === commitDetailPath) {
         sendJson(response, 200, await readCommitDetail(repoPath, sha));
+      } else if (url.pathname === commitFilesPath) {
+        sendJson(response, 200, await readCommitFiles(repoPath, sha));
       } else {
         const path = url.searchParams.get('path');
         if (!path) {
           sendJson(response, 400, { error: 'path is required.' });
           return;
         }
-        sendJson(response, 200, await readCommitDiff(repoPath, sha, path));
+        sendJson(response, 200, url.pathname === commitFilePath
+          ? await readCommitFileContent(repoPath, sha, path)
+          : await readCommitDiff(repoPath, sha, path));
       }
       break;
     }
@@ -138,6 +155,10 @@ export async function handleGitRequest(
       break;
     }
   } catch (error: unknown) {
+    if (error instanceof GitIndexLockedError || error instanceof GitSubmoduleDirtyError) {
+      sendJson(response, 409, { error: error.message });
+      return;
+    }
     console.error('Git request failed:', error);
     sendJson(response, 500, { error: error instanceof Error ? error.message : String(error) });
   }

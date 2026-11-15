@@ -26,6 +26,7 @@ const overview = ref<RepositoryOverview>();
 const status = ref<WorktreeStatus>({ staged: [], unstaged: [] });
 const loading = ref(true);
 const busy = ref(false);
+const pendingIndexPath = ref<string>();
 const error = ref('');
 const overviewError = ref('');
 const refreshKey = ref(0);
@@ -86,7 +87,11 @@ async function refresh() {
 }
 
 async function changeIndex(file: GitFileChange, action: GitIndexAction) {
+  if (busy.value || loading.value) {
+    return;
+  }
   busy.value = true;
+  pendingIndexPath.value = file.path;
   error.value = '';
   try {
     await repo.changeIndex(file.path, action);
@@ -94,6 +99,7 @@ async function changeIndex(file: GitFileChange, action: GitIndexAction) {
   } catch (cause: unknown) {
     error.value = cause instanceof Error ? cause.message : String(cause);
   } finally {
+    pendingIndexPath.value = undefined;
     busy.value = false;
   }
 }
@@ -114,8 +120,10 @@ async function commit(input: GitCommitInput) {
   }
 }
 
-watch([selectedFile, refreshKey], async ([selected]) => {
-  diff.value = undefined;
+watch([selectedFile, refreshKey], async ([selected], [previous]) => {
+  if (selected?.file.path !== previous?.file.path || selected?.staged !== previous?.staged) {
+    diff.value = undefined;
+  }
   diffError.value = '';
   if (!selected) {
     return;
@@ -191,6 +199,7 @@ onBeforeUnmount(() => {
         v-model:amend="amend"
         :status="status"
         :selected="selectedFile"
+        :pending-path="pendingIndexPath"
         :diff="diff"
         :diff-error="diffError"
         :error="error"

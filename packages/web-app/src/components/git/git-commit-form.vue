@@ -6,6 +6,8 @@ const props = defineProps<{
   busy?: boolean;
   hasStagedChanges: boolean;
   previousMessage?: string;
+  commitBlockedReason?: string;
+  amendBlockedReason?: string;
 }>();
 const summary = defineModel<string>('summary', { default: '' });
 const description = defineModel<string>('description', { default: '' });
@@ -13,6 +15,7 @@ const amend = defineModel<boolean>('amend', { default: false });
 const emit = defineEmits<{ submit: [input: GitCommitInput] }>();
 const canSubmit = computed(() => {
   return !props.busy && !!summary.value.trim()
+    && !(amend.value ? props.amendBlockedReason : props.commitBlockedReason)
     && (amend.value ? props.previousMessage !== undefined : props.hasStagedChanges);
 });
 
@@ -21,6 +24,11 @@ watch(amend, (enabled) => {
     const [first, ...rest] = props.previousMessage.split('\n');
     summary.value = first;
     description.value = rest.join('\n').trim();
+  }
+});
+watch(() => props.amendBlockedReason, (reason) => {
+  if (reason) {
+    amend.value = false;
   }
 });
 
@@ -62,14 +70,15 @@ function submit() {
         variant="flat"
         :loading="busy"
         :disabled="!canSubmit"
+        :title="amend ? amendBlockedReason : commitBlockedReason"
       >
         Commit
       </v-btn>
-      <label>
+      <label :title="amendBlockedReason">
         <input
           v-model="amend"
           type="checkbox"
-          :disabled="busy || previousMessage === undefined"
+          :disabled="busy || previousMessage === undefined || !!amendBlockedReason"
         >
         Amend
       </label>

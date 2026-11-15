@@ -1,14 +1,30 @@
 <script setup lang="ts" generic="T extends FileTreeEntry">
 import { computed, ref } from 'vue';
 import type { FileTreeEntry } from './file-tree';
+import TreeDisclosure from './tree-disclosure.vue';
 
 const props = withDefaults(defineProps<{
   items: readonly T[];
   compactFolders?: boolean;
-}>(), { compactFolders: true });
+  defaultExpanded?: boolean;
+  disabledPaths?: readonly string[];
+}>(), {
+  compactFolders: true,
+  defaultExpanded: true,
+  disabledPaths: () => [],
+});
 const selected = defineModel<string>();
-const emit = defineEmits<{ select: [item: T] }>();
-const collapsed = ref(new Set<string>());
+const emit = defineEmits<{
+  select: [item: T];
+  activate: [item: T];
+  contextmenu: [event: MouseEvent, item: T];
+}>();
+const expanded = ref(new Map<string, boolean>());
+const disabled = computed(() => new Set(props.disabledPaths));
+
+function isExpanded(path: string) {
+  return expanded.value.get(path) ?? props.defaultExpanded;
+}
 
 interface TreeNode {
   path: string;
@@ -52,7 +68,7 @@ const rows = computed(() => {
         name += `/${node.name}`;
       }
       result.push({ node, name, depth });
-      if (!collapsed.value.has(node.path)) {
+      if (isExpanded(node.path)) {
         append(node.children, depth + 1);
       }
     }
@@ -63,16 +79,27 @@ const rows = computed(() => {
 });
 
 function select(node: TreeNode) {
+  if (disabled.value.has(node.path)) {
+    return;
+  }
   if (node.children.size) {
-    if (collapsed.value.has(node.path)) {
-      collapsed.value.delete(node.path);
-    } else {
-      collapsed.value.add(node.path);
-    }
+    expanded.value.set(node.path, !isExpanded(node.path));
   } else if (node.item) {
     selected.value = node.path;
     emit('select', node.item);
   }
+}
+
+function contextMenu(event: MouseEvent, node: TreeNode) {
+  if (disabled.value.has(node.path)) {
+    event.preventDefault();
+    event.stopPropagation();
+    return;
+  }
+  if (!node.item) {
+    return;
+  }
+  emit('contextmenu', event, node.item);
 }
 
 function navigate(event: KeyboardEvent, index: number) {
@@ -94,15 +121,15 @@ function navigate(event: KeyboardEvent, index: number) {
     target = rows.value.length - 1;
     break;
   case 'ArrowRight':
-    if (node.children.size && collapsed.value.has(node.path)) {
-      collapsed.value.delete(node.path);
+    if (node.children.size && !isExpanded(node.path)) {
+      expanded.value.set(node.path, true);
     } else if (node.children.size) {
       target = index + 1;
     }
     break;
   case 'ArrowLeft':
-    if (node.children.size && !collapsed.value.has(node.path)) {
-      collapsed.value.add(node.path);
+    if (node.children.size && isExpanded(node.path)) {
+      expanded.value.set(node.path, false);
     } else {
       let parentIndex = index - 1;
       while (parentIndex >= 0 && rows.value[parentIndex].depth >= rows.value[index].depth) {
@@ -116,6 +143,10 @@ function navigate(event: KeyboardEvent, index: number) {
   default: return;
   }
   event.preventDefault();
+  const direction = ['ArrowUp', 'ArrowLeft', 'End'].includes(event.key) ? -1 : 1;
+  while (buttons[target]?.disabled) {
+    target += direction;
+  }
   buttons[target]?.focus();
 }
 </script>
@@ -129,32 +160,38 @@ function navigate(event: KeyboardEvent, index: number) {
       v-for="({ node, name, depth }, index) in rows"
       :key="node.path"
       class="tree-row"
-      :class="{ selected: selected === node.path }"
+      :class="{ selected: selected === node.path, disabled: disabled.has(node.path) }"
       :style="{ paddingLeft: `${0.5 + depth}em` }"
       @keydown="navigate($event, index)"
+      @contextmenu="contextMenu($event, node)"
     >
       <button
         class="entry"
         type="button"
         role="treeitem"
+        :disabled="disabled.has(node.path)"
+        :aria-disabled="disabled.has(node.path) || undefined"
         :aria-level="depth + 1"
-        :aria-expanded="node.children.size ? !collapsed.has(node.path) : undefined"
+        :aria-expanded="node.children.size ? isExpanded(node.path) : undefined"
         :aria-selected="!node.children.size ? selected === node.path : undefined"
         :title="node.path"
         @click="select(node)"
+        @dblclick="
+          node.item && !disabled.has(node.path)
+            && $event.button === 0 && emit('activate', node.item)
+        "
       >
-        <span
-          v-if="node.children.size"
-          class="chevron"
-          aria-hidden="true"
-        >
-          {{ collapsed.has(node.path) ? '›' : '⌄' }}
+        <span class="prefix">
+          <tree-disclosure
+            v-if="node.children.size"
+            :expanded="isExpanded(node.path)"
+          />
+          <slot
+            v-else
+            name="prefix"
+            :item="node.item!"
+          />
         </span>
-        <slot
-          v-else
-          name="prefix"
-          :item="node.item!"
-        />
         <span class="name">{{ name }}</span>
       </button>
       <slot
@@ -173,12 +210,14 @@ function navigate(event: KeyboardEvent, index: number) {
   align-items: center;
   min-height: 1.6em;
   padding-right: 0.5em;
-  &:hover { background: var(--hover); }
+  &:hover:not(.disabled) { background: var(--hover); }
   &.selected { background: var(--selected); }
+  &.disabled { opacity: 0.5; cursor: wait; }
 }
 .entry {
   appearance: none;
   border: 0;
+  padding: 0;
   background: transparent;
   font: inherit;
   cursor: pointer;
@@ -191,7 +230,15 @@ function navigate(event: KeyboardEvent, index: number) {
   color: inherit;
   text-align: left;
   &:focus-visible { outline: 1px solid var(--accent); outline-offset: -1px; }
+  &:disabled { cursor: wait; }
 }
 .name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.chevron { width: 0.85em; flex-shrink: 0; color: var(--muted); text-align: center; }
+.prefix {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 1em;
+  height: 1em;
+  flex: 0 0 1em;
+}
 </style>

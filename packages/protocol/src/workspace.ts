@@ -1,0 +1,103 @@
+import type { GitCommit, GitReference, WorktreeStatus } from './git';
+export interface WorkspaceBranch extends GitReference {
+  revision: string;
+}
+
+export const glinkStatePath = '/api/glink/state';
+export const workspacesPath = '/api/workspaces';
+
+export enum ProjectBindingKind {
+  branch = 'branch',
+  commit = 'commit',
+}
+export enum WorkspaceConnectionKind {
+  manual = 'manual',
+  submodule = 'submodule',
+}
+
+export interface WorkspaceProject {
+  id: string;
+  name: string;
+  worktreePath: string;
+  baseCommit?: string;
+  settled: boolean;
+  binding: { kind: ProjectBindingKind; revision: string };
+}
+
+export interface WorkspaceConnection {
+  from: string;
+  to: string;
+  kind: WorkspaceConnectionKind;
+}
+
+export interface WorkspaceDocument {
+  version: 1;
+  id: string;
+  name: string;
+  createdAt: string;
+  updatedAt: string;
+  projects: WorkspaceProject[];
+  connections: WorkspaceConnection[];
+}
+
+export interface WorkspaceSummary {
+  id: string;
+  name: string;
+  fileName: string;
+  projectCount: number;
+  updatedAt: string;
+}
+
+export interface GlinkState {
+  version: 1;
+  workspaces: WorkspaceSummary[];
+}
+
+export interface GlinkCatalog extends GlinkState {
+  home: string;
+}
+
+export interface CreateWorkspaceInput {
+  name: string;
+  worktreePaths: string[];
+  dependencies?: Array<{ fromPath: string; toPath: string }>;
+}
+
+export interface UpdateProjectInput {
+  name: string;
+  settled: boolean;
+  baseCommit?: string;
+  binding: WorkspaceProject['binding'];
+  dependencyIds: string[];
+}
+
+export interface WorkspaceProjectStatus extends WorktreeStatus {
+  projectId: string;
+  head?: string;
+  baseCommit?: string;
+  branch?: string;
+  indexFingerprint: string;
+  error?: string;
+}
+
+export interface WorkspaceCommit extends GitCommit {
+  projectId: string;
+}
+
+export interface WorkspaceCommitInput {
+  projectIds: string[];
+  message: string;
+  amend?: boolean;
+  expected: Array<{
+    projectId: string;
+    head?: string;
+    baseCommit?: string;
+    indexFingerprint: string;
+  }>;
+}
+
+export interface WorkspaceCommitResult {
+  committed: Array<{ projectId: string; sha: string }>;
+  skipped: string[];
+  failed?: { projectId: string; error: string };
+}

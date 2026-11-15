@@ -30,12 +30,12 @@ const DiffView = defineAsyncComponent(() => import('../diff-view.vue'));
       {{ error }}
     </p>
     <diff-view
-      v-else-if="diff && path"
+      v-if="diff && path"
       :original="diff.original"
       :modified="diff.modified"
     />
     <p
-      v-else-if="path"
+      v-else-if="path && !error"
       class="status"
       role="status"
     >

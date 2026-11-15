@@ -1,5 +1,9 @@
 import {
   commitDetailPath,
+  commitFilesPath,
+  commitFilePath,
+  type GitCommitFilesResponse,
+  type GitCommitFileResponse,
   commitDiffPath,
   commitGraphPath,
   fileDiffPath,
@@ -17,6 +21,16 @@ import {
 } from '@glink/protocol/git';
 
 export class GitService {
+  getCommitFiles(repoPath: string, sha: string, signal?: AbortSignal) {
+    const query = new URLSearchParams({ repoPath, sha });
+    return this._request<GitCommitFilesResponse>(`${commitFilesPath}?${query}`, { signal });
+  }
+
+  getCommitFile(repoPath: string, sha: string, path: string, signal?: AbortSignal) {
+    const query = new URLSearchParams({ repoPath, sha, path });
+    return this._request<GitCommitFileResponse>(`${commitFilePath}?${query}`, { signal });
+  }
+
   getRepositoryOverview(repoPath: string, signal?: AbortSignal) {
     const query = new URLSearchParams({ repoPath });
     return this._request<RepositoryOverview>(`${repositoryOverviewPath}?${query}`, { signal });

@@ -17,6 +17,14 @@ export class GitRepoService {
     return this.gitService.getRepositoryOverview(this.repoPath, signal);
   }
 
+  getCommitFiles(sha: string, signal?: AbortSignal) {
+    return this.gitService.getCommitFiles(this.repoPath, sha, signal);
+  }
+
+  getCommitFile(sha: string, path: string, signal?: AbortSignal) {
+    return this.gitService.getCommitFile(this.repoPath, sha, path, signal);
+  }
+
   getCommitGraph(maxCommits = commitGraphLimit, signal?: AbortSignal) {
     return this.gitService.getCommitGraph(
       this.repoPath, Math.min(maxCommits, commitGraphLimit), signal,

@@ -5,7 +5,8 @@
   "type": "module",
   "exports": {
     "./health": "./lib/health.js",
-    "./git": "./lib/git.js"
+    "./git": "./lib/git.js",
+    "./workspace": "./lib/workspace.js"
   },
   "scripts": {
     "build": "vite build && tsc -b --force",

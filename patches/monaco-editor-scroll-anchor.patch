@@ -1,0 +1,102 @@
+diff --git a/esm/vs/editor/browser/stableEditorScroll.js b/esm/vs/editor/browser/stableEditorScroll.js
+index 824a9e81bbc3a182f6575fd0f069327302b46000..ade05f809dd6bf193a54d79e121da79096902d60 100644
+--- a/esm/vs/editor/browser/stableEditorScroll.js
++++ b/esm/vs/editor/browser/stableEditorScroll.js
+@@ -3,9 +3,9 @@
+  *  Licensed under the MIT License. See License.txt in the project root for license information.
+  *--------------------------------------------------------------------------------------------*/
+ class StableEditorScrollState {
+-    static capture(editor) {
+-        if (editor.getScrollTop() === 0 || editor.hasPendingScrollAnimation()) {
+-            // Never mess with the scroll top if the editor is at the top of the file or if there is a pending scroll animation
++    static capture(editor, preserveAtTop = false) {
++        if ((!preserveAtTop && editor.getScrollTop() === 0) || editor.hasPendingScrollAnimation()) {
++            // Explicit unfolding also needs an anchor at scrollTop zero: hidden lines may precede the viewport.
+             return new StableEditorScrollState(editor.getScrollTop(), editor.getContentHeight(), null, 0, null);
+         }
+         let visiblePosition = null;
+diff --git a/esm/vs/editor/browser/widget/diffEditor/features/hideUnchangedRegionsFeature.js b/esm/vs/editor/browser/widget/diffEditor/features/hideUnchangedRegionsFeature.js
+index c7e609cf08f2c95b6be749b9474dd0b2bcee33ee..3f82596716c4cc9374c3c032a79c2c3237d6fe46 100644
+--- a/esm/vs/editor/browser/widget/diffEditor/features/hideUnchangedRegionsFeature.js
++++ b/esm/vs/editor/browser/widget/diffEditor/features/hideUnchangedRegionsFeature.js
+@@ -14,6 +14,7 @@ import { Position } from '../../../../common/core/position.js';
+ import { Range } from '../../../../common/core/range.js';
+ import { SymbolKinds } from '../../../../common/languages.js';
+ import { observableCodeEditor } from '../../../observableCodeEditor.js';
++import { StableEditorScrollState } from '../../../stableEditorScroll.js';
+ import { PlaceholderViewZone, applyObservableDecorations, ViewZoneOverlayWidget, applyStyle } from '../utils.js';
+ import { observableValue } from '../../../../../base/common/observableInternal/observables/observableValue.js';
+ import { derivedDisposable, derived } from '../../../../../base/common/observableInternal/observables/derived.js';
+@@ -288,7 +289,7 @@ let CollapsedCodeOverlayWidget = class CollapsedCodeOverlayWidget extends ViewZo
+                 h('div.disclosure-toggle@toggle'),
+                 h('div.first@first', { style: { display: 'flex', alignItems: 'center', flexShrink: '0' } }, [
+                     h('span.line-number-control@lineNumberControl', { 'aria-hidden': 'true' }),
+-                    $('a.default-control', { title: localize(142, 'Show Unchanged Region'), role: 'button', onclick: () => { this._unchangedRegion.showAll(undefined); } }, ...renderLabelWithIcons('$(unfold)'))
++                    $('a.default-control', { title: localize(142, 'Show Unchanged Region'), role: 'button', onclick: () => { this._showAll(); } }, ...renderLabelWithIcons('$(unfold)'))
+                 ]),
+                 h('div.content-row@others', { style: { display: 'flex', justifyContent: 'center', alignItems: 'center' } }),
+             ]),
+@@ -379,7 +380,7 @@ let CollapsedCodeOverlayWidget = class CollapsedCodeOverlayWidget extends ViewZo
+                 didMove = didMove || Math.abs(delta) > 2;
+                 const lineDelta = Math.round(delta / editor.getOption(75 /* EditorOption.lineHeight */));
+                 const newVal = Math.max(0, Math.min(cur + lineDelta, this._unchangedRegion.getMaxVisibleLineCountTop()));
+-                this._unchangedRegion.visibleLineCountTop.set(newVal, undefined);
++                this._runWithViewportScrollAnchor(() => this._unchangedRegion.visibleLineCountTop.set(newVal, undefined));
+             });
+             const mouseUpListener = addDisposableListener(window, 'mouseup', e => {
+                 if (!didMove) {
+@@ -387,7 +388,7 @@ let CollapsedCodeOverlayWidget = class CollapsedCodeOverlayWidget extends ViewZo
+                         this._unchangedRegion.collapseAll(undefined);
+                     }
+                     else {
+-                        this._unchangedRegion.showMoreAbove(this._options.hideUnchangedRegionsRevealLineCount.get(), undefined);
++                        this._runWithViewportScrollAnchor(() => this._unchangedRegion.showMoreAbove(this._options.hideUnchangedRegionsRevealLineCount.get(), undefined));
+                     }
+                 }
+                 this._nodes.top.classList.toggle('dragging', false);
+@@ -450,7 +451,7 @@ let CollapsedCodeOverlayWidget = class CollapsedCodeOverlayWidget extends ViewZo
+                             return;
+                         }
+                         e.preventDefault();
+-                        this._unchangedRegion.showAll(undefined);
++                        this._showAll();
+                     }));
+                 }
+                 children.push(span);
+@@ -508,9 +509,23 @@ let CollapsedCodeOverlayWidget = class CollapsedCodeOverlayWidget extends ViewZo
+             this._unchangedRegion.collapseAll(undefined);
+         }
+         else {
+-            this._unchangedRegion.showAll(undefined);
++            this._showAll();
+         }
+     }
++    _showAll() {
++        this._runWithViewportScrollAnchor(() => this._unchangedRegion.showAll(undefined));
++    }
++    _runWithViewportScrollAnchor(update) {
++        const scrollState = StableEditorScrollState.capture(this._editor, true);
++        const model = this._editor.getModel();
++        update();
++        // Hidden areas and their view zones update separately in the same observable transaction.
++        queueMicrotask(() => {
++            if (this._editor.getModel() === model) {
++                scrollState.restore(this._editor);
++            }
++        });
++    }
+     _isFullyRevealed(reader) {
+         return this._unchangedRegion.visibleLineCountTop.read(reader)
+             + this._unchangedRegion.visibleLineCountBottom.read(reader)
+@@ -522,10 +537,7 @@ let CollapsedCodeOverlayWidget = class CollapsedCodeOverlayWidget extends ViewZo
+             this._runWithScrollAnchor(anchorLineNumber, update);
+             return;
+         }
+-        const scrollTop = this._editor.getScrollTop();
+-        const top = this._getTopForLineNumber(anchorLineNumber);
+-        update();
+-        this._editor.setScrollTop(scrollTop + this._getTopForLineNumber(anchorLineNumber) - top);
++        this._runWithViewportScrollAnchor(update);
+     }
+     _getTopForLineNumber(lineNumber) {
+         return lineNumber > this._editor.getModel().getLineCount()

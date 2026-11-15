@@ -1,0 +1,156 @@
+.workspace-theme {
+  --ws-surface: #fff;
+  --ws-side: #f5f6f8;
+  --ws-text: #242a34;
+  --ws-muted: #707887;
+  --ws-line: #dfe3e9;
+  --ws-blue: #3467bd;
+  --ws-green: #267b54;
+  --ws-orange: #a57218;
+  --ws-red: #b84650;
+  --ws-active: color-mix(in srgb, var(--ws-blue) 11%, var(--ws-surface));
+  background: var(--ws-side);
+  color: var(--ws-text);
+  font:
+    13px/1.45 'Segoe UI',
+    'Microsoft YaHei',
+    system-ui,
+    sans-serif;
+  *,
+  *::before,
+  *::after {
+    box-sizing: border-box;
+  }
+  button,
+  input,
+  textarea,
+  select {
+    font: inherit;
+    color: inherit;
+  }
+  button {
+    background: transparent;
+    border: 0;
+    cursor: pointer;
+    border-radius: 0.4em;
+  }
+  button:hover:not(:disabled) {
+    background: var(--ws-active);
+  }
+  button:disabled {
+    opacity: 0.45;
+    cursor: default;
+  }
+  :focus-visible {
+    outline: 2px solid var(--ws-blue);
+    outline-offset: -1px;
+  }
+  p,
+  h1,
+  h2,
+  h3 {
+    margin: 0;
+  }
+  .muted,
+  .ws-empty {
+    color: var(--ws-muted);
+  }
+  .ws-empty {
+    padding: 2em;
+    text-align: center;
+  }
+  .ws-error {
+    color: var(--ws-red);
+    padding: 0.6em;
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+  }
+  .ws-panel {
+    background: var(--ws-surface);
+    border: 1px solid var(--ws-line);
+    border-radius: 0.8em;
+    min-width: 0;
+    min-height: 0;
+  }
+  .ws-button {
+    border: 1px solid var(--ws-line);
+    border-radius: 0.45em;
+    padding: 0.4em 0.8em;
+    white-space: nowrap;
+  }
+  .ws-button.primary {
+    background: var(--ws-blue);
+    border-color: var(--ws-blue);
+    color: white;
+  }
+  .ws-button.primary:hover:not(:disabled) {
+    background: color-mix(in srgb, var(--ws-blue) 85%, black);
+  }
+  .ws-icon {
+    padding: 0.15em 0.4em;
+    flex-shrink: 0;
+  }
+  .ws-actions {
+    display: flex;
+    align-items: center;
+    gap: 0.6em;
+    justify-content: flex-end;
+  }
+  input:not([type='checkbox']),
+  textarea,
+  select {
+    background: var(--ws-surface);
+    border: 1px solid var(--ws-line);
+    border-radius: 0.45em;
+    padding: 0.5em 0.65em;
+    min-width: 0;
+  }
+  input[type='checkbox'] {
+    accent-color: var(--ws-blue);
+  }
+  .ws-field {
+    display: flex;
+    flex-direction: column;
+    gap: 0.4em;
+    margin: 1em 0;
+  }
+  .ws-check {
+    display: flex;
+    align-items: center;
+    gap: 0.5em;
+    margin: 0.5em 0;
+  }
+  dialog {
+    color: var(--ws-text);
+    background: var(--ws-surface);
+    border: 1px solid var(--ws-line);
+    border-radius: 0.8em;
+    padding: 1.6em;
+    width: 36em;
+    max-width: 95vw;
+    max-height: 90dvh;
+    margin: auto;
+    box-shadow: 0 1em 4em #242a3426;
+  }
+  dialog::backdrop {
+    background: #242a3433;
+  }
+  dialog h2 {
+    font-size: 1.25em;
+    font-weight: 600;
+  }
+  .ws-shared {
+    --surface: var(--ws-surface);
+    --sidebar: var(--ws-side);
+    --text: var(--ws-text);
+    --muted: var(--ws-muted);
+    --divider: var(--ws-line);
+    --accent: var(--ws-blue);
+    --error: var(--ws-red);
+    --added: var(--ws-green);
+    --deleted: var(--ws-red);
+    --modified: var(--ws-orange);
+    --hover: var(--ws-active);
+    --selected: var(--ws-active);
+  }
+}

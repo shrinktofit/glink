@@ -6,6 +6,8 @@ export const gitIndexPath = '/api/git/index';
 export const gitCommitPath = '/api/git/commit';
 export const commitDetailPath = '/api/git/commit-detail';
 export const commitDiffPath = '/api/git/commit-diff';
+export const commitFilesPath = '/api/git/commit-files';
+export const commitFilePath = '/api/git/commit-file';
 export const repositoryOverviewPath = '/api/git/overview';
 
 export interface GitReference {
@@ -73,12 +75,15 @@ export interface GitFileChange {
   path: string;
   originalPath?: string;
   type: GitDiffType;
+  stageBlockedReason?: string;
 }
 
 export interface WorktreeStatus {
   unstaged: GitFileChange[];
   staged: GitFileChange[];
   headMessage?: string;
+  commitBlockedReason?: string;
+  amendBlockedReason?: string;
 }
 
 export interface FileDiffResponse {
@@ -107,4 +112,19 @@ export interface GitCommitDetail extends GitCommit {
   message: string;
   authorEmail: string;
   files: GitFileChange[];
+}
+
+export interface GitCommitTreeEntry {
+  path: string;
+  sha: string;
+  mode: string;
+}
+
+export interface GitCommitFilesResponse {
+  files: GitCommitTreeEntry[];
+}
+
+export interface GitCommitFileResponse {
+  content: string;
+  binary: boolean;
 }

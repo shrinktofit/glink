@@ -5,6 +5,8 @@ import {
   type FileDiffResponse,
   type GitCommitDetail,
   type GitFileChange,
+  type GitCommitFilesResponse,
+  type GitCommitFileResponse,
 } from '@glink/protocol/git';
 
 const execFileAsync = promisify(execFile);
@@ -84,7 +86,35 @@ async function readCommitFile(repoPath: string, sha: string, path: string) {
   if (mode === '160000') {
     return `Subproject commit ${objectSha}\n`;
   }
+  if (mode === '040000') {
+    throw new Error('Select a file, not a directory.');
+  }
   return runGit(repoPath, ['cat-file', 'blob', objectSha]);
+}
+
+export async function readCommitFiles(
+  repoPath: string, sha: string,
+): Promise<GitCommitFilesResponse> {
+  const output = await runGit(repoPath, [
+    'ls-tree',
+    '-r',
+    '-z',
+    sha,
+  ]);
+  const files = output.split('\0').filter(Boolean).map((entry) => {
+    const separator = entry.indexOf('\t');
+    const [mode, , objectSha] = entry.slice(0, separator).split(' ');
+    return { path: entry.slice(separator + 1), mode, sha: objectSha };
+  });
+  return { files };
+}
+
+export async function readCommitFileContent(
+  repoPath: string, sha: string, path: string,
+): Promise<GitCommitFileResponse> {
+  const content = await readCommitFile(repoPath, sha, path);
+  const binary = content.includes('\0');
+  return { content: binary ? '' : content, binary };
 }
 
 export async function readCommitDiff(
