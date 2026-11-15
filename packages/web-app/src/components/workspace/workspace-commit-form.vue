@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { computed, ref, watch } from 'vue';
 import type { WorkspaceDocument, WorkspaceProjectStatus } from '@glink/protocol/workspace';
+import { useWorkspaceCommitFilterStore } from '../../ui-state/workspace-commit-filter-store';
 const props = defineProps<{
   workspace: WorkspaceDocument;
   statuses: WorkspaceProjectStatus[];
@@ -8,16 +9,26 @@ const props = defineProps<{
   loading: boolean;
 }>();
 const emit = defineEmits<{ submit: [projectIds: string[], message: string, amend: boolean] }>();
-const selected = ref(props.workspace.projects.map((project) => project.id));
+const filter = useWorkspaceCommitFilterStore();
+const projectIds = computed(() => props.workspace.projects.map((project) => project.id));
+const selected = computed({
+  get() {
+    const excluded = new Set(filter.excluded[props.workspace.id] ?? []);
+    return projectIds.value.filter((id) => !excluded.has(id));
+  },
+  set(ids: string[]) {
+    const included = new Set(ids);
+    filter.excludeProjects(props.workspace.id, projectIds.value.filter((id) => !included.has(id)));
+  },
+});
 const message = ref('');
 const description = ref('');
 const showFilter = ref(false);
 const amend = ref(false);
 watch(
-  () => props.workspace.projects.map((project) => project.id),
-  (ids, previous) => {
-    selected.value = ids.filter((id) => !previous.includes(id) || selected.value.includes(id));
-  },
+  [() => props.workspace.id, projectIds],
+  ([workspaceId, ids]) => filter.pruneProjects(workspaceId, ids),
+  { immediate: true },
 );
 const eligible = computed(() =>
   props.statuses.filter(

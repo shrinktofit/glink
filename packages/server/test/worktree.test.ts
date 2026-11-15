@@ -54,7 +54,13 @@ describe('Worktree HTTP operations against real Git repositories', () => {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ repoPath, ...input }),
     });
-    expect(await response.json()).toEqual({});
+    const result = await response.json();
+    if (route === gitIndexPath) {
+      expect(result).toHaveProperty('staged');
+      expect(result).toHaveProperty('unstaged');
+    } else {
+      expect(result).toEqual({});
+    }
     expect(response.status).toBe(200);
   }
 

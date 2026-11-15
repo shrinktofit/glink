@@ -1,7 +1,12 @@
 <script setup lang="ts">
 import { computed } from 'vue';
 import type { WorkspaceCommit, WorkspaceDocument } from '@glink/protocol/workspace';
-const props = defineProps<{ workspace: WorkspaceDocument; commits: WorkspaceCommit[] }>();
+const props = defineProps<{
+  workspace: WorkspaceDocument;
+  commits: WorkspaceCommit[];
+  showProjectNames: boolean;
+  loading: boolean;
+}>();
 const selected = defineModel<WorkspaceCommit>();
 const rowHeight = 28;
 const lanes = computed(
@@ -36,6 +41,7 @@ const links = computed(() =>
   <div
     class="history-log"
     aria-label="Workspace commits"
+    :aria-busy="loading"
   >
     <div
       v-if="commits.length"
@@ -77,7 +83,10 @@ const links = computed(() =>
         :style="{ paddingLeft: `${width}px`, height: `${rowHeight}px` }"
         @click="selected = commit"
       >
-        <span class="project-label">{{
+        <span
+          v-if="showProjectNames"
+          class="project-label"
+        >{{
           workspace.projects.find((project) => project.id === commit.projectId)?.name
         }}</span>
         <span class="subject">{{ commit.subject }}</span>
@@ -89,7 +98,7 @@ const links = computed(() =>
       v-else
       class="ws-empty"
     >
-      基础提交与 HEAD 之间没有提交
+      {{ loading ? '正在读取提交…' : '基础提交与 HEAD 之间没有提交' }}
     </p>
   </div>
 </template>

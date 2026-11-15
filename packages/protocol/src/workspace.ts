@@ -1,4 +1,4 @@
-import type { GitCommit, GitReference, WorktreeStatus } from './git';
+import type { ChangesSnapshot, GitCommit, GitReference, WorktreeStatus } from './git';
 export interface WorkspaceBranch extends GitReference {
   revision: string;
 }
@@ -73,11 +73,17 @@ export interface UpdateProjectInput {
 
 export interface WorkspaceProjectStatus extends WorktreeStatus {
   projectId: string;
-  head?: string;
   baseCommit?: string;
-  branch?: string;
-  indexFingerprint: string;
+  /** Commits reachable from HEAD but not from baseCommit. */
+  aheadCount?: number;
   error?: string;
+  /** Base/HEAD ancestry restriction, independent of dirty staged gitlinks. */
+  baseAmendBlockedReason?: string;
+}
+
+export interface WorkspaceChangesSnapshot extends ChangesSnapshot {
+  projectId: string;
+  baseCommit?: string;
 }
 
 export interface WorkspaceCommit extends GitCommit {

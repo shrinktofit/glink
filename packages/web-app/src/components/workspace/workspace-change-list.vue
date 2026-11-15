@@ -1,26 +1,32 @@
 <script setup lang="ts">
-import { computed, watch } from 'vue';
-import type { GitFileChange } from '@glink/protocol/git';
+import { computed, ref, watch } from 'vue';
+import { GitIndexAction, type GitFileChange } from '@glink/protocol/git';
 import type { WorkspaceDocument, WorkspaceProjectStatus } from '@glink/protocol/workspace';
 import DiffTree from '../diff-tree.vue';
 import TreeDisclosure from '../tree-disclosure.vue';
 import { useExpansionState } from '../../ui-state/use-expansion-state';
 import { useExpansionStateStore } from '../../ui-state/expansion-state-store';
 import { gitChangesTreeStateKey } from '../../git/git-changes-tree-state-key';
+import { GitIndexScope, type GitIndexTarget } from '../../git/git-index-target';
 const props = defineProps<{
   workspace: WorkspaceDocument;
+  projectIds: readonly string[];
   statuses: WorkspaceProjectStatus[];
   staged: boolean;
   selected?: { projectId: string; path: string; staged: boolean };
-  pendingIndex?: { projectId: string; path: string };
+  pendingIndex?: { projectId: string; path?: string };
   busy: boolean;
+  loading: boolean;
 }>();
+const grouped = computed(() => props.projectIds.length > 1);
+const visibleProjects = computed(() => new Set(props.projectIds));
 const emit = defineEmits<{
   select: [projectId: string, file: GitFileChange];
-  index: [projectId: string, file: GitFileChange];
+  index: [projectId: string, target: GitIndexTarget];
 }>();
 const groups = computed(() =>
   props.workspace.projects
+    .filter((project) => visibleProjects.value.has(project.id))
     .map((project) => {
       const status = props.statuses.find((item) => item.projectId === project.id);
       return {
@@ -34,8 +40,52 @@ const groups = computed(() =>
 const count = computed(() => groups.value.reduce((sum, group) => sum + group.files.length, 0));
 
 function changeIndex(projectId: string, file: GitFileChange) {
-  if (!props.busy && (props.staged || !file.stageBlockedReason)) {
-    emit('index', projectId, file);
+  if (!props.busy && !props.loading && (props.staged || !file.stageBlockedReason)) {
+    emit('index', projectId, { scope: GitIndexScope.file, path: file.path });
+  }
+}
+
+const context = ref<{ projectId: string; x: number; y: number }>();
+const contextGroup = computed(() =>
+  groups.value.find((group) => group.project.id === context.value?.projectId),
+);
+const canChangeAll = computed(() =>
+  !props.busy && !props.loading && !contextGroup.value?.error
+  && !!contextGroup.value?.files.some((file) => props.staged || !file.stageBlockedReason),
+);
+watch([
+  () => props.busy,
+  () => props.loading,
+  contextGroup,
+  grouped,
+], ([
+  busy,
+  loading,
+  group,
+  grouped,
+]) => {
+  if (busy || loading || !group || !grouped) {
+    context.value = undefined;
+  }
+});
+
+function openContext(event: MouseEvent, projectId: string) {
+  if (props.busy || props.loading) {
+    return;
+  }
+  const bounds = (event.currentTarget as HTMLElement).getBoundingClientRect();
+  context.value = {
+    projectId,
+    x: event.clientX || bounds.left,
+    y: event.clientY || bounds.bottom,
+  };
+}
+
+function changeAll() {
+  if (canChangeAll.value) {
+    const projectId = context.value!.projectId;
+    context.value = undefined;
+    emit('index', projectId, { scope: GitIndexScope.worktree });
   }
 }
 
@@ -72,10 +122,16 @@ function toggleProject(id: string) {
         v-for="group in groups"
         :key="group.project.id"
         class="group"
+        :aria-busy="pendingIndex?.projectId === group.project.id && pendingIndex.path === undefined"
       >
-        <h3 :title="group.project.worktreePath">
+        <h3
+          v-if="grouped"
+          :title="group.project.worktreePath"
+          @contextmenu.stop.prevent="openContext($event, group.project.id)"
+        >
           <button
             class="group-toggle"
+            aria-haspopup="menu"
             :aria-expanded="isExpanded(group.project.id)"
             :aria-controls="`changes-${staged}-${group.project.id}`"
             @click="toggleProject(group.project.id)"
@@ -85,7 +141,7 @@ function toggleProject(id: string) {
           </button>
         </h3>
         <div
-          v-show="isExpanded(group.project.id)"
+          v-show="!grouped || isExpanded(group.project.id)"
           :id="`changes-${staged}-${group.project.id}`"
         >
           <p
@@ -100,8 +156,14 @@ function toggleProject(id: string) {
             :repo-path="group.project.worktreePath"
             :state-key="gitChangesTreeStateKey(group.project.worktreePath, staged)"
             :data-ready="!group.error"
+            :index-action="staged ? GitIndexAction.unstage : GitIndexAction.stage"
+            :index-disabled="busy || loading"
             :disabled-paths="
-              pendingIndex?.projectId === group.project.id ? [pendingIndex.path] : undefined
+              pendingIndex?.projectId === group.project.id
+                ? pendingIndex.path === undefined
+                  ? group.files.map((file) => file.path)
+                  : [pendingIndex.path]
+                : undefined
             "
             :model-value="
               selected?.projectId === group.project.id && selected.staged === staged
@@ -110,11 +172,14 @@ function toggleProject(id: string) {
             "
             @select="emit('select', group.project.id, $event)"
             @activate="changeIndex(group.project.id, $event)"
+            @index-directory="
+              emit('index', group.project.id, { scope: GitIndexScope.directory, path: $event })
+            "
           >
             <template #actions="{ item }">
               <button
                 class="ws-icon"
-                :disabled="busy || (!staged && !!item.stageBlockedReason)"
+                :disabled="busy || loading || (!staged && !!item.stageBlockedReason)"
                 :title="staged ? 'Unstage' : item.stageBlockedReason ?? 'Stage'"
                 :aria-label="`${staged ? 'Unstage' : 'Stage'} ${group.project.name}: ${item.path}`"
                 @click.stop="changeIndex(group.project.id, item)"
@@ -132,6 +197,32 @@ function toggleProject(id: string) {
         {{ staged ? 'No staged changes' : 'No unstaged changes' }}
       </p>
     </div>
+    <v-menu
+      v-if="context"
+      :model-value="true"
+      :target="[context.x, context.y]"
+      location="bottom start"
+      content-class="command-menu-overlay"
+      :transition="false"
+      @update:model-value="!$event && (context = undefined)"
+    >
+      <v-list
+        class="command-menu"
+        density="compact"
+        role="menu"
+        aria-label="项目修改操作"
+      >
+        <v-list-item
+          role="menuitem"
+          :disabled="!canChangeAll"
+          :aria-disabled="!canChangeAll"
+          :ripple="false"
+          @click="changeAll"
+        >
+          {{ staged ? '取消所有暂存' : '暂存所有' }}
+        </v-list-item>
+      </v-list>
+    </v-menu>
   </section>
 </template>
 <style scoped lang="less">
@@ -176,5 +267,8 @@ h3 {
 }
 .group :deep(.file-tree) {
   padding: 0.25em;
+}
+.group[aria-busy='true'] > h3 {
+  opacity: 0.5;
 }
 </style>

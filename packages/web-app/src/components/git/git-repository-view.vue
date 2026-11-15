@@ -9,6 +9,7 @@ import type {
   WorktreeStatus,
 } from '@glink/protocol/git';
 import { GitRepoService, gitRepoServiceKey } from '../../git/git-repo-service';
+import { GitIndexScope, type GitIndexTarget } from '../../git/git-index-target';
 import SplitPane from '../split-pane.vue';
 import GitHistoryView from './git-history-view.vue';
 import GitLocalChangesView from './git-local-changes-view.vue';
@@ -23,7 +24,7 @@ provide(gitRepoServiceKey, repo);
 const view = ref(GitView.history);
 const sidebarWidth = ref(0.15);
 const overview = ref<RepositoryOverview>();
-const status = ref<WorktreeStatus>({ staged: [], unstaged: [] });
+const status = ref<WorktreeStatus>({ staged: [], unstaged: [], indexFingerprint: 'unavailable' });
 const statusReady = ref(false);
 const loading = ref(true);
 const busy = ref(false);
@@ -31,6 +32,7 @@ const pendingIndexPath = ref<string>();
 const error = ref('');
 const overviewError = ref('');
 const refreshKey = ref(0);
+const historyRefreshKey = ref(0);
 const selectedCommit = ref<string>();
 const selectedFile = ref<{ file: GitFileChange; staged: boolean }>();
 const diff = ref<FileDiffResponse>();
@@ -38,7 +40,11 @@ const diffError = ref('');
 const summary = ref('');
 const description = ref('');
 const amend = ref(false);
+const lifecycle = new AbortController();
 let controller: AbortController | undefined;
+let metadataController: AbortController | undefined;
+let metadataDirty = false;
+let overviewDirty = false;
 
 const changeCount = computed(() => new Set([
   ...status.value.staged.map((file) => file.path),
@@ -52,7 +58,44 @@ const references = computed(() => overview.value
   ]
   : []);
 
+function applyStatus(state: WorktreeStatus) {
+  status.value = state;
+  statusReady.value = true;
+  const selected = selectedFile.value;
+  if (selected) {
+    const files = selected.staged ? state.staged : state.unstaged;
+    if (!files.some((file) => file.path === selected.file.path)) {
+      selectedFile.value = undefined;
+    }
+  }
+  refreshKey.value++;
+}
+
+async function refreshMetadata() {
+  const request = new AbortController();
+  metadataController = request;
+  try {
+    const [state, repository] = await Promise.all([
+      metadataDirty ? repo.getWorktreeStatus(request.signal) : undefined,
+      repo.getRepositoryOverview(request.signal),
+    ]);
+    if (!request.signal.aborted) {
+      if (state) {
+        applyStatus(state);
+        metadataDirty = false;
+      }
+      overview.value = repository;
+      overviewDirty = false;
+    }
+  } catch (cause: unknown) {
+    if (!request.signal.aborted) {
+      overviewError.value = String(cause);
+    }
+  }
+}
+
 async function refresh() {
+  metadataController?.abort();
   controller?.abort();
   const request = new AbortController();
   controller = request;
@@ -67,39 +110,60 @@ async function refresh() {
   }
   const [worktreeResult, overviewResult] = results;
   if (worktreeResult.status === 'fulfilled') {
-    status.value = worktreeResult.value;
-    statusReady.value = true;
-    const selected = selectedFile.value;
-    if (selected) {
-      const files = selected.staged ? status.value.staged : status.value.unstaged;
-      if (!files.some((file) => file.path === selected.file.path)) {
-        selectedFile.value = undefined;
-      }
-    }
+    applyStatus(worktreeResult.value);
+    metadataDirty = false;
   } else {
     error.value = String(worktreeResult.reason);
   }
   if (overviewResult.status === 'fulfilled') {
     overview.value = overviewResult.value;
+    overviewDirty = false;
   } else {
     overviewError.value = String(overviewResult.reason);
   }
   loading.value = false;
-  refreshKey.value++;
+  historyRefreshKey.value++;
 }
 
-async function changeIndex(file: GitFileChange, action: GitIndexAction) {
+async function changeIndex(target: GitIndexTarget, action: GitIndexAction) {
   if (busy.value || loading.value) {
     return;
   }
   busy.value = true;
-  pendingIndexPath.value = file.path;
+  metadataController?.abort();
+  pendingIndexPath.value = target.scope === GitIndexScope.worktree ? undefined : target.path;
   error.value = '';
   try {
-    await repo.changeIndex(file.path, action);
-    await refresh();
+    const state = target.scope === GitIndexScope.file
+      ? await repo.changeIndex(target.path, action)
+      : await repo.changeAllIndex(action,
+        target.scope === GitIndexScope.directory ? target.path : undefined);
+    if (lifecycle.signal.aborted) {
+      return;
+    }
+    const headChanged = status.value.head !== state.head;
+    metadataDirty ||= headChanged;
+    overviewDirty ||= headChanged || !!state.submodulePaths
+      || status.value.branch !== state.branch;
+    applyStatus({ ...state, headMessage: headChanged ? undefined : status.value.headMessage });
+    if (headChanged) {
+      historyRefreshKey.value++;
+    }
+    if (metadataDirty || overviewDirty) {
+      void refreshMetadata();
+    }
   } catch (cause: unknown) {
+    if (lifecycle.signal.aborted) {
+      return;
+    }
     error.value = cause instanceof Error ? cause.message : String(cause);
+    try {
+      applyStatus(await repo.getWorktreeStatus(lifecycle.signal));
+      metadataDirty = false;
+    } catch (refreshError: unknown) {
+      error.value += `\n工作树状态刷新失败：${String(refreshError)}`;
+      statusReady.value = false;
+    }
   } finally {
     pendingIndexPath.value = undefined;
     busy.value = false;
@@ -111,6 +175,9 @@ async function commit(input: GitCommitInput) {
   error.value = '';
   try {
     await repo.commit(input);
+    if (lifecycle.signal.aborted) {
+      return;
+    }
     summary.value = '';
     description.value = '';
     amend.value = false;
@@ -122,12 +189,12 @@ async function commit(input: GitCommitInput) {
   }
 }
 
-watch([selectedFile, refreshKey], async ([selected], [previous]) => {
+watch([selectedFile, refreshKey, busy], async ([selected], [previous]) => {
   if (selected?.file.path !== previous?.file.path || selected?.staged !== previous?.staged) {
     diff.value = undefined;
   }
   diffError.value = '';
-  if (!selected) {
+  if (!selected || busy.value) {
     return;
   }
   const request = new AbortController();
@@ -143,6 +210,13 @@ watch([selectedFile, refreshKey], async ([selected], [previous]) => {
     }
   }
 });
+
+function selectFile(file: GitFileChange, staged: boolean) {
+  if (selectedFile.value?.file.path === file.path && selectedFile.value.staged === staged) {
+    return;
+  }
+  selectedFile.value = { file, staged };
+}
 
 function selectCommit(sha: string) {
   selectedCommit.value = sha;
@@ -160,6 +234,8 @@ onMounted(() => {
   window.addEventListener('focus', refreshOnFocus);
 });
 onBeforeUnmount(() => {
+  lifecycle.abort();
+  metadataController?.abort();
   controller?.abort();
   window.removeEventListener('focus', refreshOnFocus);
 });
@@ -191,7 +267,7 @@ onBeforeUnmount(() => {
       <git-history-view
         v-show="view === GitView.history"
         v-model="selectedCommit"
-        :refresh-key="refreshKey"
+        :refresh-key="historyRefreshKey"
         :references="references"
       />
       <git-local-changes-view
@@ -208,7 +284,7 @@ onBeforeUnmount(() => {
         :error="error"
         :busy="busy"
         :loading="loading"
-        @select="(file, staged) => selectedFile = { file, staged }"
+        @select="selectFile"
         @close="selectedFile = undefined"
         @change-index="changeIndex"
         @commit="commit"

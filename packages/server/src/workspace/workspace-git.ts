@@ -1,9 +1,5 @@
-import { execFile } from 'node:child_process';
-import { createHash } from 'node:crypto';
-import { lstat, readFile, realpath } from 'node:fs/promises';
+import { lstat, realpath } from 'node:fs/promises';
 import { join } from 'node:path';
-import process from 'node:process';
-import { promisify } from 'node:util';
 import type { GitCommit } from '@glink/protocol/git';
 import type {
   WorkspaceBranch,
@@ -11,18 +7,8 @@ import type {
   WorkspaceProjectStatus,
 } from '@glink/protocol/workspace';
 import { readWorktreeStatus } from '../git/worktree.ts';
-
-const execFileAsync = promisify(execFile);
-
-export async function runWorkspaceGit(path: string, args: string[]) {
-  const { stdout } = await execFileAsync('git', ['-C', path, ...args], {
-    encoding: 'utf8',
-    maxBuffer: 32 * 1024 * 1024,
-    windowsHide: true,
-    env: { ...process.env, GIT_OPTIONAL_LOCKS: '0', GIT_LITERAL_PATHSPECS: '1' },
-  });
-  return stdout;
-}
+import { runGit } from '../git/run-git.ts';
+import { readSubmodulePaths } from '../git/read-changes.ts';
 
 export async function hasWorktree(path: string) {
   try {
@@ -36,6 +22,17 @@ export async function hasWorktree(path: string) {
   }
 }
 
+function parseIndexSubmodules(index: string) {
+  const submodules: Array<{ path: string; sha: string }> = [];
+  for (const entry of index.split('\0')) {
+    const match = /^160000 ([a-f0-9]+) 0\t(.*)$/s.exec(entry);
+    if (match) {
+      submodules.push({ path: match[2], sha: match[1] });
+    }
+  }
+  return submodules;
+}
+
 export async function inspectWorktree(path: string) {
   if (!(await hasWorktree(path))) {
     throw new Error(`Not an initialized worktree: ${path}`);
@@ -47,108 +44,73 @@ export async function inspectWorktree(path: string) {
     branch,
     index,
   ] = await Promise.all([
-    runWorkspaceGit(canonical, ['rev-parse', '--show-toplevel']),
-    runWorkspaceGit(canonical, [
+    runGit(canonical, ['rev-parse', '--show-toplevel']),
+    runGit(canonical, [
       'log',
       '--ignore-missing',
       'HEAD',
       '-1',
       '--format=%H',
     ]),
-    runWorkspaceGit(canonical, ['branch', '--show-current']),
-    runWorkspaceGit(canonical, ['ls-files', '--stage', '-z']),
+    runGit(canonical, ['branch', '--show-current']),
+    runGit(canonical, ['ls-files', '--stage', '-z']),
   ]);
   if (root.trim().toLowerCase() !== canonical.toLowerCase()) {
     throw new Error('Select a worktree root.');
-  }
-  const submodules: Array<{ path: string; sha: string }> = [];
-  for (const entry of index.split('\0')) {
-    const match = /^160000 ([a-f0-9]+) 0\t(.*)$/s.exec(entry);
-    if (match) {
-      submodules.push({ path: match[2], sha: match[1] });
-    }
   }
   return {
     path: canonical,
     head: head.trim() || undefined,
     branch: branch.trim() || undefined,
-    submodules,
+    submodules: parseIndexSubmodules(index),
   };
 }
 
 export async function readProjectStatus(
-  project: WorkspaceProject,
+  project: WorkspaceProject, signal?: AbortSignal,
 ): Promise<WorkspaceProjectStatus> {
   if (!(await hasWorktree(project.worktreePath))) {
     throw new Error('Worktree is unavailable or not initialized.');
   }
-  const [
-    status,
-    head,
-    branch,
-    indexPath,
-  ] = await Promise.all([
-    readWorktreeStatus(project.worktreePath),
-    runWorkspaceGit(project.worktreePath, [
-      'log',
-      '--ignore-missing',
-      'HEAD',
-      '-1',
-      '--format=%H',
-    ]),
-    runWorkspaceGit(project.worktreePath, ['branch', '--show-current']),
-    runWorkspaceGit(project.worktreePath, [
-      'rev-parse',
-      '--path-format=absolute',
-      '--git-path',
-      'index',
-    ]),
+  const [status, submodulePaths] = await Promise.all([
+    readWorktreeStatus(project.worktreePath, signal),
+    readSubmodulePaths(project.worktreePath, signal),
   ]);
-  let indexFingerprint: string;
-  try {
-    indexFingerprint = createHash('sha256')
-      .update(await readFile(indexPath.trim()))
-      .digest('hex');
-  } catch (error: unknown) {
-    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
-      throw error;
-    }
-    indexFingerprint = 'missing';
-  }
-  const headSha = head.trim() || undefined;
-  let amendBlockedReason = status.amendBlockedReason;
-  if (!headSha || !project.baseCommit) {
-    amendBlockedReason = '需要有效的 HEAD 和基础提交才能修订。';
-  } else if (headSha === project.baseCommit) {
-    amendBlockedReason = 'HEAD 必须位于基础提交之后才能修订。';
+  let baseAmendBlockedReason: string | undefined;
+  let aheadCount: number | undefined;
+  if (!status.head || !project.baseCommit) {
+    baseAmendBlockedReason = '需要有效的 HEAD 和基础提交才能修订。';
+  } else if (status.head === project.baseCommit) {
+    aheadCount = 0;
+    baseAmendBlockedReason = 'HEAD 必须位于基础提交之后才能修订。';
   } else {
-    try {
-      await runWorkspaceGit(project.worktreePath, [
-        'merge-base',
-        '--is-ancestor',
-        project.baseCommit,
-        headSha,
-      ]);
-    } catch (error: unknown) {
-      if ((error as { code?: number }).code !== 1) {
-        throw error;
-      }
-      amendBlockedReason = 'HEAD 必须位于基础提交之后才能修订。';
+    const counts = await runGit(project.worktreePath, [
+      'rev-list',
+      '--left-right',
+      '--count',
+      `${project.baseCommit}...${status.head}`,
+    ], { signal });
+    const [behind, ahead] = counts.trim().split(/\s+/).map(Number);
+    aheadCount = ahead;
+    if (behind > 0 || ahead === 0) {
+      baseAmendBlockedReason = 'HEAD 必须位于基础提交之后才能修订。';
     }
   }
   return {
     ...status,
     projectId: project.id,
-    head: headSha,
     baseCommit: project.baseCommit,
-    amendBlockedReason,
-    branch: branch.trim() || undefined,
-    indexFingerprint,
+    aheadCount,
+    baseAmendBlockedReason,
+    amendBlockedReason: baseAmendBlockedReason ?? status.amendBlockedReason,
+    submodulePaths,
   };
 }
 
-export async function readProjectCommits(project: WorkspaceProject): Promise<GitCommit[]> {
-  const output = await runWorkspaceGit(project.worktreePath, [
+export async function readProjectCommits(
+  project: WorkspaceProject, signal?: AbortSignal,
+): Promise<GitCommit[]> {
+  const output = await runGit(project.worktreePath, [
     'log',
     '--ignore-missing',
     '--topo-order',
@@ -157,7 +119,7 @@ export async function readProjectCommits(project: WorkspaceProject): Promise<Git
     '--format=%H%x00%P%x00%s%x00%an%x00%aI',
     '-z',
     project.baseCommit ? `${project.baseCommit}..HEAD` : 'HEAD',
-  ]);
+  ], { signal });
   const fields = output.split('\0');
   const commits: GitCommit[] = [];
   for (let index = 0; index < fields.length - 1; index += 5) {
@@ -176,7 +138,7 @@ export async function readProjectBranches(project: WorkspaceProject): Promise<Wo
   if (!await hasWorktree(project.worktreePath)) {
     throw new Error('Worktree is unavailable or not initialized.');
   }
-  const output = await runWorkspaceGit(project.worktreePath, [
+  const output = await runGit(project.worktreePath, [
     'for-each-ref',
     '--format=%(refname)%00%(objectname)%00%(HEAD)%00%(symref)',
     'refs/heads',

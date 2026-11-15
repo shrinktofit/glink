@@ -6,9 +6,9 @@ import {
   type WorkspaceProjectStatus,
 } from '@glink/protocol/workspace';
 const props = defineProps<{ workspace: WorkspaceDocument;
-  selected?: string;
+  selected: readonly string[];
   statuses: WorkspaceProjectStatus[]; }>();
-const emit = defineEmits<{ select: [id: string]; edit: [id: string] }>();
+const emit = defineEmits<{ select: [id: string, event: MouseEvent]; edit: [id: string] }>();
 
 function liveState(id: string) {
   const status = props.statuses.find((item) => item.projectId === id);
@@ -76,13 +76,14 @@ function edgePath(from: string, to: string) {
         v-for="node in layout"
         :key="node.id"
         class="node"
-        :class="{ selected: node.id === selected }"
+        :class="{ selected: selected.includes(node.id) }"
         :style="{ left: `${node.x}px`, top: `${node.y}px` }"
       >
         <button
           class="node-pick"
           :title="node.worktreePath"
-          @click="emit('select', node.id)"
+          :aria-pressed="selected.includes(node.id)"
+          @click="emit('select', node.id, $event)"
         >
           <strong>{{ node.name }}</strong>
           <small>{{ liveState(node.id) }}</small>

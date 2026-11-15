@@ -1,10 +1,11 @@
 import { execFile } from 'node:child_process';
 import { once } from 'node:events';
-import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, rename, rm, writeFile } from 'node:fs/promises';
 import { createServer, type Server } from 'node:http';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { promisify } from 'node:util';
+import process from 'node:process';
 import type { GitReference } from '@glink/protocol/git';
 import { parse } from 'yaml';
 import {
@@ -124,6 +125,385 @@ describe('Workspace HTTP operations in isolated temporary repositories', () => {
     await rm(directory, { recursive: true, force: true });
   });
 
+  async function slowCleanFilter(path: string) {
+    const marker = join(directory, 'filter-started');
+    const release = join(directory, 'filter-release');
+    const script = join(directory, 'slow-filter.cjs');
+    await writeFile(script, `
+      const fs = require('node:fs');
+      fs.writeFileSync(${JSON.stringify(marker)}, String(process.pid));
+      while (!fs.existsSync(${JSON.stringify(release)})) {
+        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10);
+      }
+      process.stdin.pipe(process.stdout);
+    `);
+    await writeFile(join(path, '.gitattributes'), 'file.txt filter=glink-test\n');
+    await git(path, 'add', '.gitattributes');
+    await git(path, 'commit', '-m', 'Add filter configuration');
+    const command = `"${process.execPath.replaceAll('\\', '/')}" "${script.replaceAll('\\', '/')}"`;
+    await git(path, 'config', 'filter.glink-test.clean', command);
+    await writeFile(join(path, 'file.txt'), 'edit\n');
+    return { marker, release };
+  }
+
+  it('serializes the same index across APIs without blocking linked worktrees', async () => {
+    /// @case A slow stage overlaps writes through both APIs and in a linked worktree.
+    /// @expect Same-index writes wait; the linked index completes while the first stage is blocked.
+    const first = await repository('first');
+    const linked = join(directory, 'linked');
+    await git(first, 'worktree', 'add', '-b', 'linked', linked);
+    const workspace = await create([first, linked]);
+    const firstId = workspace.projects[0].id;
+    const linkedId = workspace.projects[1].id;
+    await writeFile(join(linked, 'file.txt'), 'linked changes\n');
+    await writeFile(join(first, 'other.txt'), 'other changes\n');
+    const { marker, release } = await slowCleanFilter(first);
+    const pending = request<WorkspaceProjectStatus>(`workspaces/${workspace.id}/index`, 'POST', {
+      projectId: firstId,
+      path: 'file.txt',
+      action: 'stage',
+    });
+    let queued: Promise<unknown> | undefined;
+    let settled = false;
+    try {
+      await expect.poll(async () => readFile(marker, 'utf8').catch(() => '')).not.toBe('');
+      queued = request('git/index', 'POST', {
+        repoPath: first,
+        path: 'other.txt',
+        action: 'stage',
+      }).finally(() => {
+        settled = true;
+      });
+      const independent = await request<WorkspaceProjectStatus>(
+        `workspaces/${workspace.id}/index`, 'POST', {
+          projectId: linkedId,
+          path: 'file.txt',
+          action: 'stage',
+        },
+      );
+      expect(independent.staged.map((file) => file.path)).toContain('file.txt');
+      expect(settled).toBe(false);
+    } finally {
+      await writeFile(release, 'release');
+      await Promise.all([pending, queued]);
+    }
+    const state = await request<WorkspaceProjectStatus[]>(`workspaces/${workspace.id}/status`);
+    expect(state[0].staged.map((file) => file.path)).toEqual(['file.txt', 'other.txt']);
+  }, 20000);
+
+  it('terminates Git and its clean-filter descendant when a diff read is canceled', async () => {
+    /// @case A diff read is blocked inside a Git clean filter, then the HTTP reader disconnects.
+    /// @expect Cancellation terminates the owned process tree, including its clean filter.
+    const path = await repository('target');
+    const { marker, release } = await slowCleanFilter(path);
+    const controller = new AbortController();
+    const query = new URLSearchParams({ repoPath: path, path: 'file.txt', staged: 'false' });
+    const pending = fetch(`${origin}/api/git/diff?${query}`, { signal: controller.signal })
+      .catch((error: unknown) => error);
+    try {
+      await expect.poll(async () => readFile(marker, 'utf8').catch(() => '')).not.toBe('');
+      const pid = Number(await readFile(marker, 'utf8'));
+      controller.abort();
+      await pending;
+      await expect.poll(() => {
+        try {
+          process.kill(pid, 0);
+          return true;
+        } catch (error: unknown) {
+          if ((error as NodeJS.ErrnoException).code !== 'ESRCH') {
+            throw error;
+          }
+          return false;
+        }
+      }).toBe(false);
+    } finally {
+      controller.abort();
+      await writeFile(release, 'release');
+      await pending;
+    }
+  }, 20000);
+
+  it.each(['workspace', 'repository'])(
+    'uses scoped validation and one changes scan for %s staging', async (mode) => {
+      /// @case A normal tracked file is staged through the public API with Git tracing enabled.
+      /// @expect Validate its path, read changes once, and avoid HEAD metadata queries.
+      const path = await repository('target');
+      const workspace = await create([path]);
+      const projectId = workspace.projects[0].id;
+      await writeFile(join(path, 'file.txt'), 'changed\n');
+      const trace = join(directory, 'git-trace.json');
+      const previous = process.env.GIT_TRACE2_EVENT;
+      process.env.GIT_TRACE2_EVENT = trace.replaceAll('\\', '/');
+      try {
+        const route = mode === 'workspace' ? `workspaces/${workspace.id}/index` : 'git/index';
+        const state = await request<WorkspaceProjectStatus>(route, 'POST', {
+          projectId,
+          repoPath: path,
+          path: 'file.txt',
+          action: 'stage',
+        });
+        expect(state.staged.map((file) => file.path)).toEqual(['file.txt']);
+        expect(state.head).toBe(workspace.projects[0].baseCommit);
+        expect(state.indexFingerprint).toMatch(/^[a-f0-9]{64}$/);
+        const commands = (await readFile(trace, 'utf8')).trim().split('\n')
+          .map((line) => JSON.parse(line) as { event: string; argv?: string[] })
+          .filter((event) => event.event === 'start').map((event) => event.argv!);
+        const statuses = commands.filter((args) => args.includes('status'));
+        expect(statuses.filter((args) => !args.includes('file.txt'))).toHaveLength(1);
+        expect(statuses.filter((args) => args.includes('file.txt'))).toHaveLength(1);
+        expect(commands.some((args) => [
+          'log',
+          'branch',
+          'rev-list',
+          'ls-files',
+          'diff',
+        ]
+          .some((command) => args.includes(command)))).toBe(false);
+      } finally {
+        if (previous === undefined) {
+          delete process.env.GIT_TRACE2_EVENT;
+        } else {
+          process.env.GIT_TRACE2_EVENT = previous;
+        }
+      }
+    }, 60000,
+  );
+
+  it('returns fresh index state and supports scoped status reads', async () => {
+    /// @case One project stages/unstages while another worktree is unavailable.
+    /// @expect Each mutation returns authoritative target state without discovering other projects.
+    const path = await repository('target');
+    const other = await repository('other');
+    const workspace = await create([path, other]);
+    const projectId = workspace.projects[0].id;
+    const route = `workspaces/${workspace.id}`;
+    await rename(other, `${other}-moved`);
+    await writeFile(join(path, 'file.txt'), 'changed\n');
+    const staged = await request<WorkspaceProjectStatus>(`${route}/index`, 'POST', {
+      projectId,
+      path: 'file.txt',
+      action: 'stage',
+    });
+    expect(staged.projectId).toBe(projectId);
+    expect(staged.staged.map((file) => file.path)).toEqual(['file.txt']);
+    expect(staged.unstaged).toEqual([]);
+    expect(staged.indexFingerprint).toMatch(/^[a-f0-9]{64}$/);
+    const unstaged = await request<WorkspaceProjectStatus>(`${route}/index-all`, 'POST', {
+      projectId,
+      action: 'unstage',
+    });
+    expect(unstaged.staged).toEqual([]);
+    expect(unstaged.unstaged.map((file) => file.path)).toEqual(['file.txt']);
+    const query = new URLSearchParams({ projectId });
+    const states = await request<WorkspaceProjectStatus[]>(`${route}/status?${query}`);
+    expect(states.map((state) => state.projectId)).toEqual([projectId]);
+    expect(states[0].error).toBeUndefined();
+    query.set('projectId', 'missing');
+    await request(`${route}/status?${query}`, 'GET', undefined, 404);
+  }, 60000);
+
+  it('reports submodule membership after staging and unstaging registration', async () => {
+    /// @case A new clean submodule is registered, unstaged, then staged again.
+    /// @expect Return current index membership for precise topology invalidation.
+    const child = await repository('child-source');
+    const parent = await repository('parent');
+    await git(parent, '-c', 'protocol.file.allow=always', 'submodule', 'add', child, 'child');
+    const workspace = await create([parent]);
+    const projectId = workspace.projects[0].id;
+    const route = `workspaces/${workspace.id}/index-all`;
+    const unstaged = await request<WorkspaceProjectStatus>(route, 'POST', {
+      projectId,
+      action: 'unstage',
+    });
+    expect(unstaged.submodulePaths).toEqual([]);
+    const staged = await request<WorkspaceProjectStatus>(route, 'POST', {
+      projectId,
+      action: 'stage',
+    });
+    expect(staged.submodulePaths).toEqual(['child']);
+  }, 60000);
+
+  it.each(['workspace', 'repository'])('scopes %s actions by directory', async (mode) => {
+    /// @case A linked worktree has nested changes, a similar sibling and a cross-directory rename.
+    /// @expect Preserve other paths, the other worktree and both sides of a rename.
+    const main = await repository('main');
+    const path = join(directory, 'linked');
+    await git(main, 'worktree', 'add', '-b', 'linked', path);
+    const workspace = await create([path]);
+    const projectId = workspace.projects[0].id;
+    const route = mode === 'workspace' ? `workspaces/${workspace.id}/index-all` : 'git/index-all';
+    const input = { projectId, repoPath: path };
+    await mkdir(join(path, 'src', 'deep'), { recursive: true });
+    await mkdir(join(path, 'src-other'));
+    await mkdir(join(path, 'target'));
+    await writeFile(join(path, 'src', 'deep', 'new [文件].txt'), 'nested\n');
+    await writeFile(join(path, 'src', 'plain.txt'), 'plain\n');
+    await writeFile(join(path, 'src-other', 'outside.txt'), 'sibling\n');
+    await writeFile(join(path, 'file.txt'), 'outside\n');
+
+    await request(route, 'POST', { ...input, directory: 'src', action: 'stage' });
+    expect(await git(path, 'diff', '--cached', '--name-only', '-z')).toBe(
+      'src/deep/new [文件].txt\0src/plain.txt\0',
+    );
+    await request(route, 'POST', { ...input, directory: 'src/deep', action: 'unstage' });
+    expect(await git(path, 'diff', '--cached', '--name-only')).toBe('src/plain.txt');
+    expect(await readFile(join(path, 'src', 'deep', 'new [文件].txt'), 'utf8')).toBe('nested\n');
+
+    await git(path, 'mv', 'file.txt', 'target/renamed.txt');
+    await request(route, 'POST', { ...input, directory: 'target', action: 'unstage' });
+    expect(await git(path, 'diff', '--cached', '--name-only')).toBe('src/plain.txt');
+    expect(await readFile(join(path, 'target', 'renamed.txt'), 'utf8')).toBe('outside\n');
+    expect(await git(main, 'diff', '--cached', '--name-only')).toBe('');
+    expect(await readFile(join(main, 'file.txt'), 'utf8')).toBe('base\n');
+    await request(route, 'POST', { ...input, directory: 'gone', action: 'stage' });
+    expect(await git(path, 'diff', '--cached', '--name-only')).toBe('src/plain.txt');
+    await request(route, 'POST', { ...input, directory: '', action: 'stage' }, 400);
+    await request(route, 'POST', { ...input, directory: 42, action: 'stage' }, 400);
+  }, 60000);
+
+  it.each(['workspace', 'repository'])('skips dirty pointers in a %s directory', async (mode) => {
+    /// @case A directory contains a dirty child worktree and a normal edit; a sibling also changes.
+    /// @expect Only the normal edit is staged, without touching the dirty pointer or child index.
+    const source = await repository('source');
+    const parent = await repository('parent');
+    await git(parent, '-c', 'protocol.file.allow=always', 'submodule', 'add', source, 'src/child');
+    await git(parent, 'commit', '-am', 'Add child');
+    const workspace = await create([parent]);
+    const route = mode === 'workspace' ? `workspaces/${workspace.id}/index-all` : 'git/index-all';
+    const child = join(parent, 'src', 'child');
+    const pointer = await git(parent, 'rev-parse', 'HEAD:src/child');
+    await git(child, 'commit', '--allow-empty', '-m', 'Advance');
+    await writeFile(join(child, 'file.txt'), 'dirty child\n');
+    await writeFile(join(parent, 'src', 'ordinary.txt'), 'parent edit\n');
+    await writeFile(join(parent, 'file.txt'), 'outside edit\n');
+
+    await request(route, 'POST', {
+      projectId: workspace.projects[0].id,
+      repoPath: parent,
+      directory: 'src',
+      action: 'stage',
+    });
+    expect(await git(parent, 'diff', '--cached', '--name-only')).toBe('src/ordinary.txt');
+    expect(await git(parent, 'rev-parse', ':src/child')).toBe(pointer);
+    expect(await git(child, 'diff', '--cached', '--name-only')).toBe('');
+    expect(await readFile(join(child, 'file.txt'), 'utf8')).toBe('dirty child\n');
+  }, 60000);
+
+  it('stages and unstages all changes only in the selected linked worktree', async () => {
+    /// @case One project has a rename, deletion and literal untracked path; another also changes.
+    /// @expect Batch index actions affect only the selected worktree and never its working files.
+    const main = await repository('main');
+    await writeFile(join(main, 'deleted.txt'), 'delete me\n');
+    await git(main, 'add', '.');
+    await git(main, 'commit', '-m', 'Tracked deletion fixture');
+    const path = join(directory, 'linked');
+    await git(main, 'worktree', 'add', '-b', 'linked', path);
+    const workspace = await create([main, path]);
+    const project = workspace.projects[1];
+    const route = `workspaces/${workspace.id}/index-all`;
+    await git(path, 'mv', 'file.txt', 'renamed.txt');
+    await writeFile(join(path, 'renamed.txt'), 'base\nnew line\n');
+    await writeFile(join(path, 'new [文件].txt'), 'new\n');
+    await rm(join(path, 'deleted.txt'));
+    await writeFile(join(main, 'file.txt'), 'other worktree\n');
+    const head = await git(path, 'rev-parse', 'HEAD');
+    await request(route, 'POST', { projectId: project.id, action: 'stage' });
+    expect(await git(path, 'show', ':renamed.txt')).toBe('base\nnew line');
+    expect(await git(path, 'show', ':new [文件].txt')).toBe('new');
+    expect(await git(path, 'ls-files', 'file.txt', 'deleted.txt')).toBe('');
+    expect(await git(main, 'diff', '--cached', '--name-only')).toBe('');
+    await request(route, 'POST', { projectId: project.id, action: 'unstage' });
+    expect(await git(path, 'diff', '--cached', '--name-only')).toBe('');
+    expect(await readFile(join(path, 'renamed.txt'), 'utf8')).toBe('base\nnew line\n');
+    expect(await readFile(join(path, 'new [文件].txt'), 'utf8')).toBe('new\n');
+    expect(await readFile(join(main, 'file.txt'), 'utf8')).toBe('other worktree\n');
+    expect(await git(path, 'rev-parse', 'HEAD')).toBe(head);
+    await request(route, 'POST', { projectId: project.id, action: 'unstage' });
+    await request(route, 'POST', { projectId: project.id, action: 'invalid' }, 400);
+  }, 60000);
+
+  it('stages files and clean pointers while leaving dirty submodules untouched', async () => {
+    /// @case A parent has normal edits plus clean and dirty submodules with advanced HEADs.
+    /// @expect Stage-all skips dirty pointers; unstage-all also works after pointers become dirty.
+    const source = await repository('source');
+    const parent = await repository('parent');
+    for (const name of ['clean', 'dirty']) {
+      await git(parent, '-c', 'protocol.file.allow=always', 'submodule', 'add', source, name);
+    }
+    await git(parent, 'commit', '-am', 'Add children');
+    const workspace = await create([parent]);
+    const project = workspace.projects[0];
+    const route = `workspaces/${workspace.id}/index-all`;
+    const oldPointer = await git(parent, 'rev-parse', 'HEAD:dirty');
+    for (const name of ['clean', 'dirty']) {
+      await git(join(parent, name), 'commit', '--allow-empty', '-m', 'Advance');
+    }
+    await writeFile(join(parent, 'dirty', 'file.txt'), 'dirty child\n');
+    await writeFile(join(parent, 'file.txt'), 'ordinary edit\n');
+    await request(route, 'POST', { projectId: project.id, action: 'stage' });
+    expect(await git(parent, 'diff', '--cached', '--name-only')).toBe('clean\nfile.txt');
+    expect(await git(parent, 'rev-parse', ':dirty')).toBe(oldPointer);
+    expect(await git(parent, 'rev-parse', ':clean')).toBe(
+      await git(join(parent, 'clean'), 'rev-parse', 'HEAD'),
+    );
+    await request(route, 'POST', { projectId: project.id, action: 'stage' });
+    await writeFile(join(parent, 'clean', 'untracked.txt'), 'now dirty\n');
+    await request(route, 'POST', { projectId: project.id, action: 'unstage' });
+    expect(await git(parent, 'diff', '--cached', '--name-only')).toBe('');
+    expect(await readFile(join(parent, 'file.txt'), 'utf8')).toBe('ordinary edit\n');
+    expect(await readFile(join(parent, 'dirty', 'file.txt'), 'utf8')).toBe('dirty child\n');
+  }, 60000);
+
+  it('keeps a new dirty submodule unstaged after unstaging its registration', async () => {
+    /// @case A newly added submodule is unstaged, then edited before staging all parent changes.
+    /// @expect Its now-untracked pointer stays unstaged while ordinary parent files are staged.
+    const source = await repository('source');
+    const parent = await repository('parent');
+    await git(parent, '-c', 'protocol.file.allow=always', 'submodule', 'add', source, 'child');
+    const workspace = await create([parent]);
+    const project = workspace.projects[0];
+    const route = `workspaces/${workspace.id}/index-all`;
+    await request(route, 'POST', { projectId: project.id, action: 'unstage' });
+    await writeFile(join(parent, 'child', 'file.txt'), 'dirty child\n');
+    await writeFile(join(parent, 'file.txt'), 'ordinary edit\n');
+    await request(route, 'POST', { projectId: project.id, action: 'stage' });
+    expect(await git(parent, 'ls-files', '--stage', 'child')).toBe('');
+    expect(await git(parent, 'show', ':file.txt')).toBe('ordinary edit');
+    const statuses = await request<WorkspaceProjectStatus[]>(`workspaces/${workspace.id}/status`);
+    expect(statuses[0].unstaged.find((file) => file.path.replace(/\/$/, '') === 'child')
+      ?.stageBlockedReason).toContain('子模块');
+    await writeFile(join(parent, 'child', 'file.txt'), 'base\n');
+    await request(route, 'POST', { projectId: project.id, action: 'stage' });
+    expect(await git(parent, 'rev-parse', ':child')).toBe(
+      await git(join(parent, 'child'), 'rev-parse', 'HEAD'),
+    );
+  }, 60000);
+
+  it('handles large unborn indexes and lock conflicts without losing work', async () => {
+    /// @case An unborn project exceeds the Windows command-line limit and has an index lock.
+    /// @expect Batch commands handle every path, keep working files and report 409 on lock.
+    const path = join(directory, 'unborn');
+    await mkdir(path);
+    await git(path, 'init', '-b', 'main');
+    const files = Array.from({ length: 400 }, (_, index) => `${index}-${'x'.repeat(90)}.txt`);
+    await Promise.all(files.map((file) => writeFile(join(path, file), 'new\n')));
+    const workspace = await create([path]);
+    const project = workspace.projects[0];
+    const route = `workspaces/${workspace.id}/index-all`;
+    const lock = join(path, '.git', 'index.lock');
+    await writeFile(lock, 'test lock');
+    await request(route, 'POST', { projectId: project.id, action: 'stage' }, 409);
+    expect(await readFile(lock, 'utf8')).toBe('test lock');
+    await rm(lock);
+    await request(route, 'POST', { projectId: project.id, action: 'stage' });
+    expect((await git(path, 'ls-files')).split('\n')).toHaveLength(files.length);
+    await request(route, 'POST', { projectId: project.id, action: 'unstage' });
+    expect(await git(path, 'ls-files')).toBe('');
+    expect(await Promise.all(files.map((file) => readFile(join(path, file), 'utf8'))))
+      .toEqual(files.map(() => 'new\n'));
+    await request(route, 'POST', { projectId: project.id, action: 'unstage' });
+  }, 60000);
+
   it('persists metadata and rejects cycles without checking out branches', async () => {
     /// @case Two worktrees form a workspace; metadata is edited and the server reopened.
     /// @expect YAML survives reopening, invalid cycles are rejected, and Git state is unchanged.
@@ -219,6 +599,98 @@ describe('Workspace HTTP operations in isolated temporary repositories', () => {
     );
     expect(remaining.projects).toHaveLength(1);
     expect(await git(join(parent, 'child'), 'rev-parse', 'HEAD')).toBe(childProject.baseCommit);
+  }, 60000);
+
+  it('counts commits ahead of each project base', async () => {
+    /// @case HEAD moves after, before and away from base; base can also be absent.
+    /// @expect Count HEAD minus base, including divergence, without enabling unsafe amend.
+    const path = await repository('project');
+    const workspace = await create([path]);
+    const project = workspace.projects[0];
+    const route = `workspaces/${workspace.id}`;
+    const status = async () => (await request<WorkspaceProjectStatus[]>(`${route}/status`))[0];
+    expect((await status()).aheadCount).toBe(0);
+    await git(path, 'commit', '--allow-empty', '-m', 'First');
+    expect((await status()).aheadCount).toBe(1);
+    await git(path, 'commit', '--allow-empty', '-m', 'Second');
+    const ahead = await status();
+    expect(ahead.aheadCount).toBe(2);
+    expect(ahead.amendBlockedReason).toBeUndefined();
+    await request(`${route}/projects/${project.id}`, 'PATCH', {
+      ...project,
+      baseCommit: ahead.head,
+      dependencyIds: [],
+    });
+    expect((await status()).aheadCount).toBe(0);
+    await git(path, 'checkout', '--detach', project.baseCommit!);
+    expect((await status()).aheadCount).toBe(0);
+    await git(path, 'commit', '--allow-empty', '-m', 'Divergent');
+    const divergent = await status();
+    expect(divergent.aheadCount).toBe(1);
+    expect(divergent.amendBlockedReason).toContain('基础提交');
+    await request(`${route}/projects/${project.id}`, 'PATCH', {
+      ...project,
+      baseCommit: '',
+      dependencyIds: [],
+    });
+    expect((await status()).aheadCount).toBeUndefined();
+    const unborn = join(directory, 'unborn');
+    await mkdir(unborn);
+    await git(unborn, 'init', '-b', 'main');
+    const empty = await request<WorkspaceDocument>('workspaces', 'POST', {
+      name: 'Unborn',
+      worktreePaths: [unborn],
+    });
+    const [unbornStatus] = await request<WorkspaceProjectStatus[]>(`workspaces/${empty.id}/status`);
+    expect(unbornStatus.aheadCount).toBeUndefined();
+    expect(unbornStatus.error).toBeUndefined();
+  }, 60000);
+
+  it('filters project history before applying the workspace commit limit', async () => {
+    /// @case A busy project fills 500 rows; another selected project has an older focused commit.
+    /// @expect Return scoped history without errors from unselected projects.
+    const busy = await repository('busy');
+    const focused = await repository('focused');
+    const workspace = await create([busy, focused]);
+    const [busyProject, focusedProject] = workspace.projects;
+    const route = `workspaces/${workspace.id}/commits`;
+    const base = await git(busy, 'rev-parse', 'HEAD');
+    const stream = Array.from({ length: 501 }, (_, index) => {
+      const message = `Busy ${index}\n`;
+      return `commit refs/heads/main\nmark :${index + 1}\n`
+        + 'committer Glink Test <test@glink.local> 2000000000 +0000\n'
+        + `data ${message.length}\n${message}from ${index ? `:${index}` : base}\n\n`;
+    }).join('');
+    const importing = execute('git', [
+      '-C',
+      busy,
+      'fast-import',
+      '--quiet',
+    ], { windowsHide: true });
+    importing.child.stdin!.end(stream);
+    await importing;
+    await git(focused, 'commit', '--allow-empty', '--date=2020-01-01T00:00:00Z', '-m', 'Focused');
+    const all = await request<{ commits: WorkspaceCommit[] }>(route);
+    expect(all.commits).toHaveLength(500);
+    expect(all.commits.every((commit) => commit.projectId === busyProject.id)).toBe(true);
+    const query = new URLSearchParams({ projectId: focusedProject.id });
+    const selected = await request<{ commits: WorkspaceCommit[]; errors: unknown[] }>(
+      `${route}?${query}`,
+    );
+    expect(selected.commits).toHaveLength(1);
+    expect(selected.commits[0]).toMatchObject({ projectId: focusedProject.id, subject: 'Focused' });
+    expect(selected.errors).toEqual([]);
+    query.append('projectId', focusedProject.id);
+    expect((await request<{ commits: WorkspaceCommit[] }>(`${route}?${query}`)).commits)
+      .toHaveLength(1);
+    query.set('projectId', busyProject.id);
+    expect((await request<{ commits: WorkspaceCommit[] }>(`${route}?${query}`)).commits)
+      .toHaveLength(500);
+    await rename(busy, `${busy}-moved`);
+    query.set('projectId', focusedProject.id);
+    expect((await request<{ errors: unknown[] }>(`${route}?${query}`)).errors).toEqual([]);
+    query.set('projectId', 'missing-project');
+    await request(`${route}?${query}`, 'GET', undefined, 404);
   }, 60000);
 
   it('aggregates base..HEAD history and rejects stale staged snapshots', async () => {

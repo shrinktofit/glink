@@ -1,3 +1,4 @@
+import { readRequestSignal } from '../read-request-signal.ts';
 import { Buffer } from 'node:buffer';
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import { GitIndexAction } from '@glink/protocol/git';
@@ -8,7 +9,7 @@ import {
   type UpdateProjectInput,
   type WorkspaceCommitInput,
 } from '@glink/protocol/workspace';
-import { changeIndex, readFileDiff } from '../git/worktree.ts';
+import { changeAllIndex, changeIndex, readFileDiff } from '../git/worktree.ts';
 import { handleRequest } from '../request-handler.ts';
 import { commitWorkspace, workspaceHistory, workspaceStatuses } from './workspace-operations.ts';
 import { WorkspaceError, WorkspaceStore } from './workspace-store.ts';
@@ -36,6 +37,12 @@ async function body<T>(request: IncomingMessage): Promise<T> {
 export async function createGlinkRequestHandler(options: { glinkHome: string }) {
   const store = await WorkspaceStore.open(options.glinkHome);
 
+  async function readRequestedProjects(id: string, url: URL) {
+    const document = await store.get(id);
+    const ids = [...new Set(url.searchParams.getAll('projectId'))];
+    return ids.length ? ids.map((id) => store.project(document, id)) : document.projects;
+  }
+
   async function workspaceRequest(request: IncomingMessage, response: ServerResponse, url: URL) {
     const parts = url.pathname
       .slice(workspacesPath.length)
@@ -44,6 +51,7 @@ export async function createGlinkRequestHandler(options: { glinkHome: string }) 
       .map(decodeURIComponent);
     const [id, section, projectId] = parts;
     const method = request.method;
+    const signal = method === 'GET' ? readRequestSignal(response) : undefined;
     let result: unknown;
     if (url.pathname === glinkStatePath && method === 'GET') {
       result = await store.catalog();
@@ -65,9 +73,9 @@ export async function createGlinkRequestHandler(options: { glinkHome: string }) 
     } else if (id && section === 'projects' && projectId && method === 'DELETE') {
       result = await store.removeProject(id, projectId);
     } else if (id && section === 'status' && method === 'GET') {
-      result = await workspaceStatuses(await store.get(id));
+      result = await workspaceStatuses(await readRequestedProjects(id, url), signal);
     } else if (id && section === 'commits' && method === 'GET') {
-      result = await workspaceHistory(await store.get(id));
+      result = await workspaceHistory(await readRequestedProjects(id, url), signal);
     } else if (id && section === 'commit' && method === 'POST') {
       result = await commitWorkspace(store, id, await body<WorkspaceCommitInput>(request));
     } else if (id && section === 'diff' && method === 'GET') {
@@ -76,7 +84,27 @@ export async function createGlinkRequestHandler(options: { glinkHome: string }) 
         project.worktreePath,
         url.searchParams.get('path') ?? '',
         url.searchParams.get('staged') === 'true',
+        signal,
       );
+    } else if (id && section === 'index-all' && method === 'POST') {
+      const input = await body<{
+        projectId: string;
+        action: GitIndexAction;
+        directory?: string;
+      }>(request);
+      if (!Object.values(GitIndexAction).includes(input.action)) {
+        throw new WorkspaceError('Invalid index action.');
+      }
+      if (input.directory !== undefined
+        && (typeof input.directory !== 'string' || !input.directory)) {
+        throw new WorkspaceError('Invalid directory.');
+      }
+      const project = store.project(await store.get(id), input.projectId);
+      result = {
+        ...await changeAllIndex(project.worktreePath, input.action, input.directory),
+        projectId: project.id,
+        baseCommit: project.baseCommit,
+      };
     } else if (id && section === 'index' && method === 'POST') {
       const input = await body<{ projectId: string; path: string; action: GitIndexAction }>(
         request,
@@ -84,11 +112,12 @@ export async function createGlinkRequestHandler(options: { glinkHome: string }) 
       if (!Object.values(GitIndexAction).includes(input.action)) {
         throw new WorkspaceError('Invalid index action.');
       }
-      await store.mutate(async () => {
-        const project = store.project(await store.get(id), input.projectId);
-        await changeIndex(project.worktreePath, input.path, input.action);
-      });
-      result = {};
+      const project = store.project(await store.get(id), input.projectId);
+      result = {
+        ...await changeIndex(project.worktreePath, input.path, input.action),
+        projectId: project.id,
+        baseCommit: project.baseCommit,
+      };
     } else {
       throw new WorkspaceError('Workspace endpoint not found.', 404);
     }
@@ -108,6 +137,9 @@ export async function createGlinkRequestHandler(options: { glinkHome: string }) 
       return;
     }
     workspaceRequest(request, response, url).catch((error: unknown) => {
+      if (response.destroyed) {
+        return;
+      }
       const message = error instanceof Error ? error.message : String(error);
       response
         .writeHead(error instanceof WorkspaceError

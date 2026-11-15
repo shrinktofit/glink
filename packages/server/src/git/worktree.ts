@@ -1,141 +1,37 @@
-import { execFile } from 'node:child_process';
 import { lstat, readFile, readlink } from 'node:fs/promises';
-import { join } from 'node:path';
-import process from 'node:process';
-import { promisify } from 'node:util';
 import {
   GitDiffType,
   GitIndexAction,
+  type ChangesSnapshot,
   type FileDiffResponse,
   type GitCommitInput,
   type GitFileChange,
   type WorktreeStatus,
 } from '@glink/protocol/git';
-import { GitIndexLockedError } from './git-index-locked-error.ts';
+import { join } from 'node:path';
 import { GitSubmoduleDirtyError } from './git-submodule-dirty-error.ts';
+import { readChangesSnapshot, readStatusEntries, type StatusEntry } from './read-changes.ts';
+import { runGit } from './run-git.ts';
+import { withGitIndex } from './index-queue.ts';
 
-const execFileAsync = promisify(execFile);
-
-async function runGit(repoPath: string, args: string[]) {
-  try {
-    const { stdout } = await execFileAsync('git', ['-C', repoPath, ...args], {
-      encoding: 'utf8',
-      maxBuffer: 16 * 1024 * 1024,
-      windowsHide: true,
-      env: { ...process.env, GIT_LITERAL_PATHSPECS: '1', GIT_OPTIONAL_LOCKS: '0' },
-    });
-    return stdout;
-  } catch (error: unknown) {
-    const stderr = (error as { stderr?: string }).stderr;
-    const lock = stderr?.match(/Unable to create '(.+index\.lock)': File exists\./);
-    if (lock) {
-      throw new GitIndexLockedError(lock[1]);
-    }
-    throw error;
-  }
+export async function readWorktreeStatus(
+  repoPath: string, signal?: AbortSignal,
+): Promise<WorktreeStatus> {
+  const changes = await readChangesSnapshot(repoPath, { signal });
+  const message = changes.head
+    ? await runGit(repoPath, [
+      'log',
+      '-1',
+      '--format=%B',
+      changes.head,
+    ], { signal })
+    : undefined;
+  return { ...changes, headMessage: message?.trimEnd() };
 }
 
-export async function readWorktreeStatus(repoPath: string): Promise<WorktreeStatus> {
-  const output = await runGit(repoPath, [
-    'status',
-    '--porcelain=v1',
-    '-z',
-    '--untracked-files=all',
-    '--ignore-submodules=none',
-  ]);
-  const entries = output.split('\0');
-  const status: WorktreeStatus = { staged: [], unstaged: [] };
-  for (let index = 0; index < entries.length - 1; index++) {
-    const entry = entries[index];
-    const x = entry[0];
-    const y = entry[1];
-    const path = entry.slice(3);
-    const originalPath = /[RC]/.test(x + y) ? entries[++index] : undefined;
-    if (x === '?' && y === '?') {
-      status.unstaged.push({ path, type: GitDiffType.untracked });
-    } else if (x === 'U' || y === 'U' || x + y === 'AA' || x + y === 'DD') {
-      status.unstaged.push({ path, type: GitDiffType.unmerged });
-    } else {
-      if (x !== ' ') {
-        status.staged.push({ path, originalPath, type: x as GitDiffType });
-      }
-      if (y !== ' ') {
-        status.unstaged.push({
-          path,
-          originalPath: /[RC]/.test(y) ? originalPath : undefined,
-          type: y as GitDiffType,
-        });
-      }
-    }
-  }
-  const head = await runGit(repoPath, [
-    'log',
-    '--ignore-missing',
-    'HEAD',
-    '-1',
-    '--format=%B',
-  ]);
-  // An unborn repository has no log output. A commit message always ends with a newline.
-  if (head) {
-    status.headMessage = head.trimEnd();
-  }
-  const [unstagedLinks, stagedLinks] = await Promise.all([
-    status.unstaged.length ? readChangedSubmodules(repoPath, false) : [],
-    status.staged.length ? readChangedSubmodules(repoPath, true) : [],
-  ]);
-  const dirty = new Map<string, string>();
-  await Promise.all([...new Set([...unstagedLinks, ...stagedLinks])]
-    .map(async (path) => {
-      const child = join(repoPath, path);
-      try {
-        await lstat(join(child, '.git'));
-      } catch (error: unknown) {
-        if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
-          return; // An uninitialized or removed submodule has no working copy to inspect.
-        }
-        throw error;
-      }
-      if (await runGit(child, [
-        'status',
-        '--porcelain=v1',
-        '-z',
-        '--untracked-files=all',
-        '--ignore-submodules=none',
-      ])) {
-        dirty.set(path, `子模块 ${path} 有未提交的修改，不能暂存、提交或修订其指针。`);
-      }
-    }));
-  for (const file of status.unstaged) {
-    file.stageBlockedReason = dirty.get(file.path);
-  }
-  status.commitBlockedReason = stagedLinks.map((path) => dirty.get(path)).find(Boolean);
-  // An unchanged pointer already in HEAD does not prevent amending other files or the message.
-  status.amendBlockedReason = status.commitBlockedReason;
-  return status;
-}
-
-async function readChangedSubmodules(repoPath: string, staged: boolean) {
-  const output = await runGit(repoPath, [
-    'diff',
-    ...(staged ? ['--cached'] : []),
-    '--raw',
-    '--no-renames',
-    '-z',
-    '--ignore-submodules=none',
-    '--',
-  ]);
-  const entries = output.split('\0');
-  const paths: string[] = [];
-  for (let index = 0; index < entries.length - 1; index += 2) {
-    const [oldMode, newMode] = entries[index].slice(1).split(' ');
-    if (oldMode === '160000' || newMode === '160000') {
-      paths.push(entries[index + 1]);
-    }
-  }
-  return paths;
-}
-
-async function readStoredFile(repoPath: string, path: string, index: boolean) {
+async function readStoredFile(
+  repoPath: string, path: string, index: boolean, signal?: AbortSignal,
+) {
   const entry = index
     ? await runGit(repoPath, [
       'ls-files',
@@ -143,14 +39,14 @@ async function readStoredFile(repoPath: string, path: string, index: boolean) {
       '-z',
       '--',
       path,
-    ])
+    ], { signal })
     : await runGit(repoPath, [
       'ls-tree',
       '-z',
       'HEAD',
       '--',
       path,
-    ]);
+    ], { signal });
   const metadata = entry.slice(0, entry.indexOf('\t')).split(' ');
   const mode = metadata[0];
   const sha = metadata[index ? 1 : 2];
@@ -160,14 +56,19 @@ async function readStoredFile(repoPath: string, path: string, index: boolean) {
   if (mode === '160000') {
     return `Subproject commit ${sha}\n`;
   }
-  return runGit(repoPath, ['cat-file', 'blob', sha]);
+  return runGit(repoPath, ['cat-file', 'blob', sha], { signal });
 }
 
 export async function readFileDiff(
-  repoPath: string, path: string, staged: boolean,
+  repoPath: string, path: string, staged: boolean, signal?: AbortSignal,
 ): Promise<FileDiffResponse> {
-  const status = await readWorktreeStatus(repoPath);
-  const change = (staged ? status.staged : status.unstaged).find((item) => item.path === path);
+  const status = await readStatusEntries(repoPath, [path], signal);
+  let change = status.entries.map((entry) => staged ? entry.staged : entry.unstaged)
+    .find((item) => item?.path === path);
+  if (staged && change?.type === GitDiffType.added) {
+    const indexed = await readIndexChanges(repoPath, signal);
+    change = indexed.entries.find((entry) => entry.staged?.path === path)?.staged ?? change;
+  }
   if (!change) {
     throw new Error('File is no longer in this change list. Refresh and try again.');
   }
@@ -177,22 +78,22 @@ export async function readFileDiff(
   let original = '';
   let modified = '';
   if (change.type !== GitDiffType.added && change.type !== GitDiffType.untracked) {
-    original = await readStoredFile(repoPath, change.originalPath ?? path, !staged);
+    original = await readStoredFile(repoPath, change.originalPath ?? path, !staged, signal);
   }
   if (change.type !== GitDiffType.deleted) {
     if (staged) {
-      modified = await readStoredFile(repoPath, path, true);
+      modified = await readStoredFile(repoPath, path, true, signal);
     } else {
       const absolutePath = join(repoPath, path);
       const info = await lstat(absolutePath);
       if (info.isSymbolicLink()) {
         modified = await readlink(absolutePath);
       } else if (info.isDirectory()) {
-        const sha = (await runGit(absolutePath, ['rev-parse', 'HEAD'])).trim();
-        const dirty = await runGit(absolutePath, ['status', '--porcelain']);
+        const sha = (await runGit(absolutePath, ['rev-parse', 'HEAD'], { signal })).trim();
+        const dirty = await runGit(absolutePath, ['status', '--porcelain'], { signal });
         modified = `Subproject commit ${sha}${dirty ? '-dirty' : ''}\n`;
       } else {
-        modified = await readFile(absolutePath, 'utf8');
+        modified = await readFile(absolutePath, { encoding: 'utf8', signal });
       }
     }
   }
@@ -202,48 +103,157 @@ export async function readFileDiff(
   return { original, modified };
 }
 
-export async function changeIndex(repoPath: string, path: string, action: GitIndexAction) {
-  const status = await readWorktreeStatus(repoPath);
-  const changes = action === GitIndexAction.stage ? status.unstaged : status.staged;
-  const change: GitFileChange | undefined = changes.find((item) => item.path === path);
-  if (!change) {
-    throw new Error('File is no longer in this change list. Refresh and try again.');
-  }
-  const paths = change.originalPath ? [change.path, change.originalPath] : [change.path];
-  if (action === GitIndexAction.stage) {
-    if (change.stageBlockedReason) {
-      throw new GitSubmoduleDirtyError(change.stageBlockedReason);
-    }
-    await runGit(repoPath, ['add', '--', ...paths]);
-  } else if (status.headMessage !== undefined) {
-    await runGit(repoPath, [
-      'reset',
-      '-q',
-      'HEAD',
-      '--',
-      ...paths,
-    ]);
-  } else {
-    await runGit(repoPath, [
-      'rm',
+/** Read only index-vs-HEAD metadata, preserving cross-directory rename pairs. */
+async function readIndexChanges(repoPath: string, signal?: AbortSignal) {
+  const [output, head] = await Promise.all([
+    runGit(repoPath, [
+      'diff',
       '--cached',
-      '-f',
+      '--raw',
+      '-z',
+      '--find-renames',
+      '--no-abbrev',
+      '--no-ext-diff',
+      '--ignore-submodules=none',
       '--',
-      ...paths,
+    ], { signal }),
+    runGit(repoPath, [
+      'rev-parse',
+      '--verify',
+      '--quiet',
+      'HEAD',
+    ], { signal }).then(
+      (head) => head.trim(),
+      (error: unknown) => {
+        if ((error as { code?: number }).code === 1) {
+          return undefined;
+        }
+        throw error;
+      },
+    ),
+  ]);
+  const records = output.split('\0');
+  const entries: StatusEntry[] = [];
+  for (let index = 0; index < records.length - 1;) {
+    const metadata = records[index++].slice(1).split(' ');
+    const type = metadata[4][0] as GitDiffType;
+    const first = records[index++];
+    const renamed = type === GitDiffType.renamed || type === GitDiffType.copied;
+    const path = renamed ? records[index++] : first;
+    entries.push({
+      staged: { path, type, ...(renamed ? { originalPath: first } : {}) },
+      headMode: metadata[0],
+      indexMode: metadata[1],
+      worktreeMode: metadata[1],
+      embedded: false,
+    });
+  }
+  return { entries, head };
+}
+
+export class GitIndexTransaction {
+  static run<T>(repoPath: string, action: (index: GitIndexTransaction) => Promise<T>) {
+    return withGitIndex(repoPath, (path) => action(new GitIndexTransaction(repoPath, path)));
+  }
+
+  readonly repoPath: string;
+  readonly indexPath: string;
+
+  readChanges(submodules = false) {
+    return readChangesSnapshot(this.repoPath, { indexPath: this.indexPath, submodules });
+  }
+
+  async change(path: string, action: GitIndexAction): Promise<ChangesSnapshot> {
+    const state = action === GitIndexAction.stage
+      ? await readStatusEntries(this.repoPath, [path])
+      : await readIndexChanges(this.repoPath);
+    const entry = state.entries.find((entry) => {
+      const file = action === GitIndexAction.stage ? entry.unstaged : entry.staged;
+      return file?.path === path || file?.path === `${path}/`;
+    });
+    const file = action === GitIndexAction.stage ? entry?.unstaged : entry?.staged;
+    if (!file || !entry) {
+      throw new Error('File is no longer in this change list. Refresh and try again.');
+    }
+    if (action === GitIndexAction.stage && file.stageBlockedReason) {
+      throw new GitSubmoduleDirtyError(file.stageBlockedReason);
+    }
+    await this._write([file], action, state.head);
+    return this.readChanges(this._changesSubmoduleMembership(entry, file, action));
+  }
+
+  async changeAll(action: GitIndexAction, directory?: string): Promise<ChangesSnapshot> {
+    const state = action === GitIndexAction.stage
+      ? await readStatusEntries(this.repoPath, directory === undefined ? undefined : [directory])
+      : await readIndexChanges(this.repoPath);
+    const selected = state.entries.flatMap((entry) => {
+      const file = action === GitIndexAction.stage ? entry.unstaged : entry.staged;
+      if (!file || (directory !== undefined && !file.path.startsWith(`${directory}/`))
+        || (action === GitIndexAction.stage && file.stageBlockedReason)) {
+        return [];
+      }
+      return [{ entry, file }];
+    });
+    await this._write(selected.map(({ file }) => file), action, state.head);
+    return this.readChanges(selected.some(({ entry, file }) =>
+      this._changesSubmoduleMembership(entry, file, action),
+    ));
+  }
+
+  async commit(input: GitCommitInput) {
+    const state = await this.readChanges();
+    const blocked = input.amend ? state.amendBlockedReason : state.commitBlockedReason;
+    if (blocked) {
+      throw new GitSubmoduleDirtyError(blocked);
+    }
+    await runGit(this.repoPath, [
+      'commit',
+      ...(input.amend ? ['--amend'] : []),
+      '-m',
+      input.message,
     ]);
+  }
+
+  private constructor(repoPath: string, indexPath: string) {
+    this.repoPath = repoPath;
+    this.indexPath = indexPath;
+  }
+
+  private _changesSubmoduleMembership(
+    entry: StatusEntry, file: GitFileChange, action: GitIndexAction,
+  ) {
+    const from = action === GitIndexAction.stage ? entry.indexMode : entry.headMode;
+    const to = action === GitIndexAction.stage ? entry.worktreeMode : entry.indexMode;
+    return entry.embedded || ((from === '160000') !== (to === '160000'))
+      || (file.type === GitDiffType.renamed && (from === '160000' || to === '160000'));
+  }
+
+  private async _write(changes: readonly GitFileChange[], action: GitIndexAction, head?: string) {
+    if (!changes.length) {
+      return;
+    }
+    const paths = [...new Set(changes.flatMap((file) =>
+      file.type === GitDiffType.renamed && file.originalPath
+        ? [file.path, file.originalPath]
+        : [file.path],
+    ))];
+    const command = action === GitIndexAction.stage
+      ? ['add']
+      : head ? ['reset', '-q', 'HEAD'] : ['rm', '--cached', '-f'];
+    await runGit(this.repoPath, [...command, '--pathspec-from-file=-', '--pathspec-file-nul'], {
+      input: paths.join('\0') + '\0',
+    });
   }
 }
 
-export async function commitWorktree(repoPath: string, input: GitCommitInput) {
-  const status = await readWorktreeStatus(repoPath);
-  const blockedReason = input.amend ? status.amendBlockedReason : status.commitBlockedReason;
-  if (blockedReason) {
-    throw new GitSubmoduleDirtyError(blockedReason);
-  }
-  await runGit(repoPath, [
-    'commit',
-    ...(input.amend ? ['--amend'] : []),
-    '-m',
-    input.message,
-  ]);
+export function changeIndex(repoPath: string, path: string, action: GitIndexAction) {
+  return GitIndexTransaction.run(repoPath, (index) => index.change(path, action));
+}
+
+export function changeAllIndex(repoPath: string, action: GitIndexAction, directory?: string) {
+  return GitIndexTransaction.run(repoPath, (index) => index.changeAll(action, directory));
+}
+
+export function commitWorktree(repoPath: string, input: GitCommitInput) {
+  return GitIndexTransaction.run(repoPath, (index) => index.commit(input));
 }

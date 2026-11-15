@@ -1,3 +1,4 @@
+import { readRequestSignal } from '../read-request-signal.ts';
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import { Buffer } from 'node:buffer';
 import {
@@ -10,6 +11,7 @@ import {
   fileDiffPath,
   gitCommitPath,
   gitIndexPath,
+  gitIndexAllPath,
   GitIndexAction,
   worktreeStatusPath,
   repositoryOverviewPath,
@@ -24,7 +26,13 @@ import {
 } from './commit-detail.ts';
 import { GitIndexLockedError } from './git-index-locked-error.ts';
 import { GitSubmoduleDirtyError } from './git-submodule-dirty-error.ts';
-import { changeIndex, commitWorktree, readFileDiff, readWorktreeStatus } from './worktree.ts';
+import {
+  changeAllIndex,
+  changeIndex,
+  commitWorktree,
+  readFileDiff,
+  readWorktreeStatus,
+} from './worktree.ts';
 
 function sendJson(response: ServerResponse, status: number, body: unknown) {
   response.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8' });
@@ -44,7 +52,7 @@ export async function handleGitRequest(
     commitFilePath,
     repositoryOverviewPath,
   ];
-  const writeRoutes = [gitIndexPath, gitCommitPath];
+  const writeRoutes = [gitIndexPath, gitIndexAllPath, gitCommitPath];
   const isRead = readRoutes.includes(url.pathname);
   if (!isRead && !writeRoutes.includes(url.pathname)) {
     response.writeHead(404).end();
@@ -83,6 +91,7 @@ export async function handleGitRequest(
     return;
   }
 
+  const signal = isRead ? readRequestSignal(response) : undefined;
   try {
     switch (url.pathname) {
     case repositoryOverviewPath:
@@ -123,7 +132,7 @@ export async function handleGitRequest(
       break;
     }
     case worktreeStatusPath:
-      sendJson(response, 200, await readWorktreeStatus(repoPath));
+      sendJson(response, 200, await readWorktreeStatus(repoPath, signal));
       break;
     case fileDiffPath: {
       const path = url.searchParams.get('path');
@@ -132,7 +141,7 @@ export async function handleGitRequest(
         sendJson(response, 400, { error: 'path and staged are required.' });
         return;
       }
-      sendJson(response, 200, await readFileDiff(repoPath, path, staged === 'true'));
+      sendJson(response, 200, await readFileDiff(repoPath, path, staged === 'true', signal));
       break;
     }
     case gitIndexPath:
@@ -141,8 +150,16 @@ export async function handleGitRequest(
         sendJson(response, 400, { error: 'path and a valid index action are required.' });
         return;
       }
-      await changeIndex(repoPath, body.path, body.action);
-      sendJson(response, 200, {});
+      sendJson(response, 200, await changeIndex(repoPath, body.path, body.action));
+      break;
+    case gitIndexAllPath:
+      if ((body.directory !== undefined
+        && (typeof body.directory !== 'string' || !body.directory))
+      || (body.action !== GitIndexAction.stage && body.action !== GitIndexAction.unstage)) {
+        sendJson(response, 400, { error: 'Invalid index action or directory.' });
+        return;
+      }
+      sendJson(response, 200, await changeAllIndex(repoPath, body.action, body.directory));
       break;
     case gitCommitPath:
       if (typeof body.message !== 'string' || !body.message.trim()
@@ -155,6 +172,9 @@ export async function handleGitRequest(
       break;
     }
   } catch (error: unknown) {
+    if (signal?.aborted) {
+      return;
+    }
     if (error instanceof GitIndexLockedError || error instanceof GitSubmoduleDirtyError) {
       sendJson(response, 409, { error: error.message });
       return;

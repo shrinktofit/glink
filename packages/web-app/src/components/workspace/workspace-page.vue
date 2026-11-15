@@ -15,8 +15,11 @@ import type {
   WorkspaceCommitResult,
   WorkspaceDocument,
   WorkspaceProjectStatus,
+  WorkspaceChangesSnapshot,
 } from '@glink/protocol/workspace';
+import { WorkspaceConnectionKind } from '@glink/protocol/workspace';
 import { appKey } from '../../app-context';
+import { GitIndexScope, type GitIndexTarget } from '../../git/git-index-target';
 import GitFileDiff from '../git/git-file-diff.vue';
 import SplitPane from '../split-pane.vue';
 import WorkspaceOutline from './workspace-outline.vue';
@@ -34,21 +37,54 @@ enum WorkspaceTab {
 }
 const tab = ref(WorkspaceTab.local);
 const statuses = ref<WorkspaceProjectStatus[]>([]);
+const statusesReady = computed(() => workspace.value.projects.every((project) =>
+  statuses.value.some((status) => status.projectId === project.id),
+));
 const commits = ref<WorkspaceCommit[]>([]);
 const historyErrors = ref<Array<{ projectId: string; error: string }>>([]);
-const selectedProject = ref(workspace.value.projects[0]?.id);
+const historyLoading = ref(false);
+const historyError = ref('');
+// Outline selection defines browsing scope independently of file and commit focus.
+const selectedProjectIds = ref(workspace.value.projects.slice(0, 1).map((project) => project.id));
+const projectSelectionAnchor = ref(selectedProjectIds.value[0]);
+const projectIds = computed(() => workspace.value.projects.map((project) => project.id));
+const selectedProjectSet = computed(() => new Set(selectedProjectIds.value));
+const grouped = computed(() => selectedProjectIds.value.length > 1);
+const scopeName = computed(() => {
+  if (!selectedProjectIds.value.length) {
+    return 'No projects selected';
+  }
+  if (!grouped.value) {
+    return workspace.value.projects.find(
+      (project) => selectedProjectSet.value.has(project.id),
+    )?.name;
+  }
+  return selectedProjectIds.value.length === workspace.value.projects.length
+    ? 'All projects'
+    : `${selectedProjectIds.value.length} projects`;
+});
+const visibleCommits = computed(() =>
+  commits.value.filter((commit) => selectedProjectSet.value.has(commit.projectId)),
+);
+const visibleHistoryErrors = computed(() =>
+  historyErrors.value.filter((entry) => selectedProjectSet.value.has(entry.projectId)),
+);
 const expanded = ref(false);
 const busy = ref(false);
-const pendingIndex = ref<{ projectId: string; path: string }>();
+// An absent path represents a pending batch for the whole project.
+const pendingIndex = ref<{ projectId: string; path?: string }>();
 const loading = ref(false);
 const refreshKey = ref(0);
+const historyRefreshKey = ref(0);
 const error = ref('');
 const diffError = ref('');
 const selection = ref<{ projectId: string; path: string; staged: boolean }>();
 const diff = ref<FileDiffResponse>();
 const diffTitle = computed(() => {
   const project = workspace.value.projects.find((item) => item.id === selection.value?.projectId);
-  return selection.value ? `${project?.name} / ${selection.value.path}` : undefined;
+  return selection.value
+    ? grouped.value ? `${project?.name} / ${selection.value.path}` : selection.value.path
+    : undefined;
 });
 const selectedCommit = ref<WorkspaceCommit>();
 const commitProject = computed(() =>
@@ -61,8 +97,196 @@ const columns = ref(0.32);
 const rows = ref(0.43);
 const changeRows = ref(0.54);
 let refreshController: AbortController | undefined;
+let relatedStatusController: AbortController | undefined;
+// A newer index mutation cancels reads, but must retain their unfinished invalidations.
+const pendingStatusIds = new Set<string>();
+const staleMetadataIds = new Set<string>();
+let structureDirty = false;
+
+watch(projectIds, (ids, previous) => {
+  const remaining = selectedProjectIds.value.filter((id) => ids.includes(id));
+  if (remaining.length !== selectedProjectIds.value.length) {
+    selectedProjectIds.value = remaining.length ? remaining : ids.slice(0, 1);
+  } else if (!previous.length && ids.length && !remaining.length) {
+    selectedProjectIds.value = ids.slice(0, 1);
+  }
+  if (!ids.includes(projectSelectionAnchor.value)) {
+    projectSelectionAnchor.value = selectedProjectIds.value[0];
+  }
+});
+
+function selectProject(id: string, event: MouseEvent) {
+  const ids = projectIds.value;
+  let next = new Set(selectedProjectIds.value);
+  const additive = event.ctrlKey || event.metaKey;
+  if (event.shiftKey) {
+    const start = ids.indexOf(projectSelectionAnchor.value ?? id);
+    const end = ids.indexOf(id);
+    if (!additive) {
+      next.clear();
+    }
+    for (const projectId of ids.slice(Math.min(start, end), Math.max(start, end) + 1)) {
+      next.add(projectId);
+    }
+    projectSelectionAnchor.value ??= id;
+  } else {
+    if (additive) {
+      if (next.has(id)) {
+        next.delete(id);
+      } else {
+        next.add(id);
+      }
+    } else {
+      next = new Set([id]);
+    }
+    projectSelectionAnchor.value = id;
+  }
+  const selected = ids.filter((projectId) => next.has(projectId));
+  if (selected.length !== selectedProjectIds.value.length
+    || selected.some((projectId, index) => projectId !== selectedProjectIds.value[index])) {
+    selectedProjectIds.value = selected;
+  }
+}
+
+watch(selectedProjectSet, (ids) => {
+  if (selection.value && !ids.has(selection.value.projectId)) {
+    selection.value = undefined;
+  }
+});
+
+watch(visibleCommits, (commits) => {
+  if (!commits.some((commit) => commit.projectId === selectedCommit.value?.projectId
+    && commit.sha === selectedCommit.value.sha)) {
+    selectedCommit.value = commits[0];
+  }
+});
+
+watch([selectedProjectIds, historyRefreshKey], async ([ids]) => {
+  const controller = new AbortController();
+  onWatcherCleanup(() => controller.abort());
+  historyError.value = '';
+  if (!ids.length) {
+    commits.value = [];
+    historyErrors.value = [];
+    historyLoading.value = false;
+    return;
+  }
+  historyLoading.value = true;
+  try {
+    const history = await service.history(workspace.value.id, ids, controller.signal);
+    if (!controller.signal.aborted) {
+      commits.value = history.commits;
+      historyErrors.value = history.errors;
+    }
+  } catch (cause: unknown) {
+    if (!controller.signal.aborted) {
+      historyError.value = String(cause);
+    }
+  } finally {
+    if (!controller.signal.aborted) {
+      historyLoading.value = false;
+    }
+  }
+}, { immediate: true });
+
+function applyStatuses(updates: WorkspaceProjectStatus[], metadataFresh = true) {
+  const states = new Map(statuses.value.map((status) => [status.projectId, status]));
+  for (const status of updates) {
+    if (metadataFresh && !status.error) {
+      staleMetadataIds.delete(status.projectId);
+    }
+    states.set(status.projectId, status);
+  }
+  statuses.value = workspace.value.projects.flatMap((project) => {
+    const status = states.get(project.id);
+    return status ? [status] : [];
+  });
+  const selected = selection.value;
+  const current = updates.find((status) => status.projectId === selected?.projectId);
+  if (selected && current) {
+    if (!(selected.staged ? current.staged : current.unstaged)
+      .some((file) => file.path === selected.path)) {
+      selection.value = undefined;
+    }
+    refreshKey.value++;
+  }
+}
+
+async function refreshRelatedStatuses(state: WorkspaceChangesSnapshot, metadataStale: boolean) {
+  const projectId = state.projectId;
+  const project = workspace.value.projects.find((project) => project.id === projectId)!;
+  const registeredPaths = new Set(workspace.value.connections
+    .filter((connection) => connection.kind === WorkspaceConnectionKind.submodule
+      && connection.from === projectId)
+    .map((connection) => workspace.value.projects.find((child) => child.id === connection.to)!
+      .worktreePath.slice(project.worktreePath.length + 1)));
+  if (state.submodulePaths && (registeredPaths.size !== state.submodulePaths.length
+    || state.submodulePaths.some((path) => !registeredPaths.has(path)))) {
+    structureDirty = true;
+  }
+  const related = new Set([projectId]);
+  let count: number;
+  do {
+    count = related.size;
+    for (const connection of workspace.value.connections) {
+      if (connection.kind === WorkspaceConnectionKind.submodule && related.has(connection.to)) {
+        related.add(connection.from);
+      }
+    }
+  } while (related.size !== count);
+  for (const id of related) {
+    pendingStatusIds.add(id);
+  }
+  if (!metadataStale) {
+    pendingStatusIds.delete(projectId);
+  }
+  if (!pendingStatusIds.size && !structureDirty) {
+    return;
+  }
+  const controller = new AbortController();
+  relatedStatusController = controller;
+  try {
+    // Use the fetched snapshot here; v-model prop updates may arrive on the next render.
+    let document = workspace.value;
+    if (structureDirty) {
+      document = await service.get(document.id, controller.signal);
+      if (controller.signal.aborted) {
+        return;
+      }
+      workspace.value = document;
+      structureDirty = false;
+      const knownIds = new Set(statuses.value.map((status) => status.projectId));
+      for (const project of document.projects) {
+        if (!knownIds.has(project.id)) {
+          pendingStatusIds.add(project.id);
+        }
+      }
+    }
+    const ids = [...pendingStatusIds].filter((id) =>
+      document.projects.some((project) => project.id === id),
+    );
+    if (!ids.length) {
+      return;
+    }
+    const states = await service.status(workspace.value.id, {
+      projectIds: ids,
+      signal: controller.signal,
+    });
+    if (!controller.signal.aborted) {
+      applyStatuses(states);
+      for (const id of ids) {
+        pendingStatusIds.delete(id);
+      }
+    }
+  } catch (cause: unknown) {
+    if (!controller.signal.aborted) {
+      error.value = `关联项目状态刷新失败：${String(cause)}`;
+    }
+  }
+}
 
 async function refresh() {
+  relatedStatusController?.abort();
   refreshController?.abort();
   const controller = new AbortController();
   refreshController = controller;
@@ -74,37 +298,14 @@ async function refresh() {
       return;
     }
     workspace.value = document;
-    if (!document.projects.some((project) => project.id === selectedProject.value)) {
-      selectedProject.value = document.projects[0]?.id;
-    }
-    const [state, history] = await Promise.all([
-      service.status(workspace.value.id, controller.signal),
-      service.history(workspace.value.id, controller.signal),
-    ]);
+    const state = await service.status(workspace.value.id, { signal: controller.signal });
     if (controller.signal.aborted) {
       return;
     }
-    statuses.value = state;
-    commits.value = history.commits;
-    historyErrors.value = history.errors;
-    if (selection.value) {
-      const current = state.find((item) => item.projectId === selection.value!.projectId);
-      const files = selection.value.staged ? current?.staged : current?.unstaged;
-      if (!files?.some((file) => file.path === selection.value!.path)) {
-        selection.value = undefined;
-      }
-    }
-    refreshKey.value++;
-    if (
-      !selectedCommit.value
-      || !history.commits.some(
-        (commit) =>
-          commit.sha === selectedCommit.value!.sha
-          && commit.projectId === selectedCommit.value!.projectId,
-      )
-    ) {
-      selectedCommit.value = history.commits[0];
-    }
+    applyStatuses(state);
+    pendingStatusIds.clear();
+    structureDirty = false;
+    historyRefreshKey.value++;
   } catch (cause: unknown) {
     if (!controller.signal.aborted) {
       error.value = String(cause);
@@ -116,7 +317,10 @@ async function refresh() {
   }
 }
 
-watch([selection, refreshKey], async ([selected], [previous]) => {
+const diffPending = computed(() => busy.value && (!pendingIndex.value
+  || pendingIndex.value.projectId === selection.value?.projectId));
+
+watch([selection, refreshKey, diffPending], async ([selected], [previous]) => {
   if (
     selected?.projectId !== previous?.projectId
     || selected?.path !== previous?.path
@@ -125,7 +329,7 @@ watch([selection, refreshKey], async ([selected], [previous]) => {
     diff.value = undefined;
   }
   diffError.value = '';
-  if (!selected) {
+  if (!selected || diffPending.value) {
     return;
   }
   const controller = new AbortController();
@@ -150,35 +354,82 @@ watch([selection, refreshKey], async ([selected], [previous]) => {
 
 async function changed(document: WorkspaceDocument) {
   workspace.value = document;
-  if (!document.projects.some((project) => project.id === selectedProject.value)) {
-    selectedProject.value = document.projects[0]?.id;
-  }
   await refresh();
 }
 
 function selectFile(projectId: string, file: GitFileChange, staged: boolean) {
+  if (selection.value?.projectId === projectId && selection.value.path === file.path
+    && selection.value.staged === staged) {
+    return;
+  }
   selection.value = { projectId, path: file.path, staged };
-  selectedProject.value = projectId;
 }
 
-async function index(projectId: string, file: GitFileChange, staged: boolean) {
-  if (busy.value) {
+async function index(projectId: string, staged: boolean, target: GitIndexTarget) {
+  if (busy.value || loading.value) {
     return;
   }
   busy.value = true;
-  pendingIndex.value = { projectId, path: file.path };
+  relatedStatusController?.abort();
+  pendingIndex.value = {
+    projectId,
+    path: target.scope === GitIndexScope.worktree ? undefined : target.path,
+  };
   error.value = '';
   result.value = undefined;
   try {
-    await service.changeIndex(
-      workspace.value.id,
-      projectId,
-      file.path,
-      staged ? GitIndexAction.unstage : GitIndexAction.stage,
-    );
-    await refresh();
+    const action = staged ? GitIndexAction.unstage : GitIndexAction.stage;
+    const state = target.scope === GitIndexScope.file
+      ? await service.changeIndex(workspace.value.id, projectId, target.path, action)
+      : await service.changeAllIndex(
+        workspace.value.id,
+        projectId,
+        action,
+        target.scope === GitIndexScope.directory ? target.path : undefined,
+      );
+    if (!focusController.signal.aborted) {
+      const previous = statuses.value.find((status) => status.projectId === state.projectId);
+      const metadataStale = !previous || !!previous.error || staleMetadataIds.has(state.projectId)
+        || previous.head !== state.head
+        || previous.baseCommit !== state.baseCommit;
+      if (metadataStale) {
+        staleMetadataIds.add(state.projectId);
+      }
+      const baseAmendBlockedReason = metadataStale
+        ? '等待有效的项目状态。'
+        : previous.baseAmendBlockedReason;
+      applyStatuses([{
+        ...state,
+        headMessage: metadataStale ? undefined : previous.headMessage,
+        aheadCount: metadataStale ? undefined : previous.aheadCount,
+        baseAmendBlockedReason,
+        amendBlockedReason: baseAmendBlockedReason ?? state.amendBlockedReason,
+        submodulePaths: state.submodulePaths ?? previous?.submodulePaths,
+      }], false);
+      if (previous?.head !== state.head) {
+        historyRefreshKey.value++;
+      }
+      void refreshRelatedStatuses(state, metadataStale);
+    }
   } catch (cause: unknown) {
     error.value = String(cause);
+    try {
+      applyStatuses(await service.status(workspace.value.id, {
+        projectIds: [projectId],
+        signal: focusController.signal,
+      }));
+    } catch (refreshError: unknown) {
+      if (!focusController.signal.aborted) {
+        applyStatuses([{
+          projectId,
+          staged: [],
+          unstaged: [],
+          indexFingerprint: 'unavailable',
+          error: String(refreshError),
+        }]);
+        error.value += `\n目标项目状态刷新失败：${String(refreshError)}`;
+      }
+    }
   } finally {
     pendingIndex.value = undefined;
     busy.value = false;
@@ -228,6 +479,7 @@ onMounted(() => {
 });
 onUnmounted(() => {
   refreshController?.abort();
+  relatedStatusController?.abort();
   focusController.abort();
 });
 </script>
@@ -238,12 +490,13 @@ onUnmounted(() => {
   >
     <workspace-outline
       ref="outline"
-      v-model:selected="selectedProject"
       v-model:expanded="expanded"
+      :selected="selectedProjectIds"
       :workspace="workspace"
       :statuses="statuses"
       :service="service"
       :busy="busy"
+      @select="selectProject"
       @changed="changed"
     />
     <section class="workarea ws-panel">
@@ -259,14 +512,14 @@ onUnmounted(() => {
         >
           All Commits
         </button><span class="scope muted">{{
-          tab === WorkspaceTab.local ? 'All projects' : 'Base → HEAD · 500 max'
+          tab === WorkspaceTab.local ? scopeName : `${scopeName} · Base → HEAD · 500 max`
         }}</span><button
           class="ws-icon"
-          :disabled="busy || loading"
+          :disabled="busy || loading || historyLoading"
           aria-label="刷新工作区"
           @click="refresh"
         >
-          {{ loading ? '…' : '↻' }}
+          {{ loading || historyLoading ? '…' : '↻' }}
         </button>
       </header>
       <p
@@ -313,24 +566,28 @@ onUnmounted(() => {
             <template #first>
               <workspace-change-list
                 :workspace="workspace"
+                :project-ids="selectedProjectIds"
                 :statuses="statuses"
                 :staged="false"
                 :selected="selection"
                 :pending-index="pendingIndex"
                 :busy="busy"
+                :loading="loading"
                 @select="(projectId, file) => selectFile(projectId, file, false)"
-                @index="(projectId, file) => index(projectId, file, false)"
+                @index="(projectId, target) => index(projectId, false, target)"
               />
             </template><template #second>
               <workspace-change-list
                 :workspace="workspace"
+                :project-ids="selectedProjectIds"
                 :statuses="statuses"
                 staged
                 :selected="selection"
                 :pending-index="pendingIndex"
                 :busy="busy"
+                :loading="loading"
                 @select="(projectId, file) => selectFile(projectId, file, true)"
-                @index="(projectId, file) => index(projectId, file, true)"
+                @index="(projectId, target) => index(projectId, true, target)"
               />
             </template>
           </split-pane>
@@ -358,23 +615,30 @@ onUnmounted(() => {
               :workspace="workspace"
               :statuses="statuses"
               :busy="busy"
-              :loading="loading"
+              :loading="loading || !statusesReady"
               @submit="commit"
             />
           </div>
         </template>
       </split-pane>
       <template v-if="tab === WorkspaceTab.history">
+        <p
+          v-if="historyError"
+          class="ws-error"
+          role="alert"
+        >
+          {{ historyError }}
+        </p>
         <div
-          v-if="historyErrors.length"
+          v-if="visibleHistoryErrors.length"
           class="history-errors"
         >
           <details>
             <summary class="muted">
-              {{ historyErrors.length }} 个 Project 无法读取历史
+              {{ visibleHistoryErrors.length }} 个 Project 无法读取历史
             </summary>
             <p
-              v-for="entry in historyErrors"
+              v-for="entry in visibleHistoryErrors"
               :key="entry.projectId"
               class="ws-error"
             >
@@ -392,7 +656,9 @@ onUnmounted(() => {
             <workspace-history
               v-model="selectedCommit"
               :workspace="workspace"
-              :commits="commits"
+              :commits="visibleCommits"
+              :show-project-names="grouped"
+              :loading="historyLoading"
             />
           </template><template #second>
             <workspace-commit-detail
@@ -421,9 +687,9 @@ onUnmounted(() => {
       </header>
       <workspace-project-graph
         :workspace="workspace"
-        :selected="selectedProject"
+        :selected="selectedProjectIds"
         :statuses="statuses"
-        @select="selectedProject = $event"
+        @select="selectProject"
         @edit="outline!.edit($event)"
       />
     </section>

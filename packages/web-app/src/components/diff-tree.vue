@@ -1,7 +1,8 @@
 <script setup lang="ts">
-import { GitDiffType, type GitFileChange } from '@glink/protocol/git';
-import { ref, watch } from 'vue';
+import { GitDiffType, GitIndexAction, type GitFileChange } from '@glink/protocol/git';
+import { computed, ref, watch } from 'vue';
 import FileTree from './file-tree.vue';
+import { fileTreePathsOverlap } from './file-tree';
 import GitFileContextMenu from './git/git-file-context-menu.vue';
 defineOptions({ inheritAttrs: false });
 
@@ -12,28 +13,62 @@ const props = withDefaults(defineProps<{
   disabledPaths?: readonly string[];
   stateKey?: string;
   dataReady?: boolean;
+  indexAction?: GitIndexAction;
+  indexDisabled?: boolean;
 }>(), {
   compactFolders: true,
   disabledPaths: () => [],
   stateKey: undefined,
   dataReady: true,
+  indexAction: undefined,
+  indexDisabled: false,
 });
 const selected = defineModel<string>();
-const emit = defineEmits<{ select: [item: GitFileChange]; activate: [item: GitFileChange] }>();
-const context = ref<{ path: string; x: number; y: number }>();
+const emit = defineEmits<{
+  select: [item: GitFileChange];
+  activate: [item: GitFileChange];
+  indexDirectory: [path: string];
+}>();
+const context = ref<{
+  path: string;
+  directory: boolean;
+  x: number;
+  y: number;
+}>();
 watch(() => props.disabledPaths, (paths) => {
-  if (context.value && paths.includes(context.value.path)) {
+  if (context.value && paths.some((path) => fileTreePathsOverlap(path, context.value!.path))) {
     context.value = undefined;
   }
 });
 
-function openMenu(event: MouseEvent, item: GitFileChange) {
+function canIndexDirectory(path: string) {
+  return !!props.indexAction && !props.indexDisabled
+    && !props.disabledPaths.some((pending) => fileTreePathsOverlap(path, pending))
+    && props.items.some((file) => file.path.startsWith(`${path}/`)
+      && (props.indexAction === GitIndexAction.unstage || !file.stageBlockedReason));
+}
+
+const contextIndexDisabled = computed(() =>
+  !context.value || !canIndexDirectory(context.value.path),
+);
+
+function indexDirectory(path: string) {
+  if (canIndexDirectory(path)) {
+    context.value = undefined;
+    emit('indexDirectory', path);
+  }
+}
+
+function openMenu(event: MouseEvent, path: string, directory: boolean) {
   event.preventDefault();
   event.stopPropagation();
   const bounds = (event.currentTarget as HTMLElement).getBoundingClientRect();
-  context.value = { path: item.path,
+  context.value = {
+    path,
+    directory,
     x: event.clientX || bounds.left,
-    y: event.clientY || bounds.bottom };
+    y: event.clientY || bounds.bottom,
+  };
 }
 
 const markers: Record<GitDiffType, { icon: string; label: string; color: string }> = {
@@ -59,7 +94,9 @@ const markers: Record<GitDiffType, { icon: string; label: string; color: string 
     :data-ready="dataReady"
     @select="emit('select', $event)"
     @activate="emit('activate', $event)"
-    @contextmenu="openMenu"
+    @activate-directory="indexDirectory"
+    @contextmenu="(event, item) => openMenu(event, item.path, false)"
+    @directory-contextmenu="(event, path) => openMenu(event, path, true)"
   >
     <template #prefix="{ item }">
       <span
@@ -82,6 +119,9 @@ const markers: Record<GitDiffType, { icon: string; label: string; color: string 
     :repo-path="repoPath"
     :x="context.x"
     :y="context.y"
+    :index-action="context.directory ? indexAction : undefined"
+    :index-disabled="contextIndexDisabled"
+    @index="indexDirectory(context.path)"
     @close="context = undefined"
   />
 </template>

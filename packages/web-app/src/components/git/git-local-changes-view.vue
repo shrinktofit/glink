@@ -11,6 +11,7 @@ import SplitPane from '../split-pane.vue';
 import GitChangeList from './git-change-list.vue';
 import GitCommitForm from './git-commit-form.vue';
 import GitFileDiff from './git-file-diff.vue';
+import type { GitIndexTarget } from '../../git/git-index-target';
 
 defineProps<{
   status: WorktreeStatus;
@@ -29,7 +30,7 @@ const amend = defineModel<boolean>('amend', { required: true });
 const emit = defineEmits<{
   select: [file: GitFileChange, staged: boolean];
   close: [];
-  changeIndex: [file: GitFileChange, action: GitIndexAction];
+  changeIndex: [target: GitIndexTarget, action: GitIndexAction];
   commit: [input: GitCommitInput];
 }>();
 const columns = ref(0.28);
@@ -57,7 +58,7 @@ const lists = ref(0.55);
             :busy="busy"
             :loading="loading"
             @select="emit('select', $event, false)"
-            @change-index="(file, action) => emit('changeIndex', file, action)"
+            @change-index="(target, action) => emit('changeIndex', target, action)"
           />
         </template>
         <template #second>
@@ -70,7 +71,7 @@ const lists = ref(0.55);
             :busy="busy"
             :loading="loading"
             @select="emit('select', $event, true)"
-            @change-index="(file, action) => emit('changeIndex', file, action)"
+            @change-index="(target, action) => emit('changeIndex', target, action)"
           />
         </template>
       </split-pane>

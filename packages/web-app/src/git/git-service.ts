@@ -9,6 +9,7 @@ import {
   fileDiffPath,
   gitCommitPath,
   gitIndexPath,
+  gitIndexAllPath,
   worktreeStatusPath,
   repositoryOverviewPath,
   type RepositoryOverview,
@@ -18,6 +19,7 @@ import {
   type GitCommitDetail,
   type GitIndexAction,
   type WorktreeStatus,
+  type ChangesSnapshot,
 } from '@glink/protocol/git';
 
 export class GitService {
@@ -64,10 +66,18 @@ export class GitService {
   }
 
   changeIndex(repoPath: string, path: string, action: GitIndexAction) {
-    return this._request<void>(gitIndexPath, {
+    return this._request<ChangesSnapshot>(gitIndexPath, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ repoPath, path, action }),
+    });
+  }
+
+  changeAllIndex(repoPath: string, action: GitIndexAction, directory?: string) {
+    return this._request<ChangesSnapshot>(gitIndexAllPath, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ repoPath, action, directory }),
     });
   }
 

@@ -40,7 +40,7 @@ const route = useRoute();
         @click="open = false"
       />
       <div
-        class="menu ws-panel"
+        class="menu command-menu"
         role="menu"
       >
         <router-link
@@ -92,23 +92,8 @@ strong {
 }
 .menu {
   position: absolute;
-  top: calc(100% + 0.5em);
+  top: calc(100% + 0.25em);
   left: 0;
-  width: 15em;
-  padding: 0.4em;
   z-index: 91;
-  box-shadow: 0 0.5em 2em #242a3420;
-}
-.menu a {
-  display: block;
-  color: inherit;
-  text-decoration: none;
-  border-radius: 0.3em;
-  width: 100%;
-  text-align: left;
-  padding: 0.65em 0.8em;
-}
-.menu a:hover {
-  background: var(--ws-active);
 }
 </style>

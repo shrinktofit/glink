@@ -10,6 +10,7 @@ import {
   type WorkspaceCommitResult,
   type WorkspaceDocument,
   type WorkspaceProjectStatus,
+  type WorkspaceChangesSnapshot,
   type WorkspaceBranch,
 } from '@glink/protocol/workspace';
 
@@ -65,15 +66,25 @@ export class WorkspaceService {
     );
   }
 
-  status(id: string, signal?: AbortSignal) {
-    return this._request<WorkspaceProjectStatus[]>(id, '/status', 'GET', undefined, signal);
+  status(id: string, options: { projectIds?: readonly string[]; signal?: AbortSignal } = {}) {
+    const query = new URLSearchParams();
+    for (const projectId of options.projectIds ?? []) {
+      query.append('projectId', projectId);
+    }
+    return this._request<WorkspaceProjectStatus[]>(
+      id, `/status?${query}`, 'GET', undefined, options.signal,
+    );
   }
 
-  history(id: string, signal?: AbortSignal) {
+  history(id: string, projectIds: readonly string[], signal?: AbortSignal) {
+    const query = new URLSearchParams();
+    for (const projectId of projectIds) {
+      query.append('projectId', projectId);
+    }
     return this._request<{
       commits: WorkspaceCommit[];
       errors: Array<{ projectId: string; error: string }>;
-    }>(id, '/commits', 'GET', undefined, signal);
+    }>(id, `/commits?${query}`, 'GET', undefined, signal);
   }
 
   diff(id: string, projectId: string, path: string, staged: boolean, signal?: AbortSignal) {
@@ -82,7 +93,19 @@ export class WorkspaceService {
   }
 
   changeIndex(id: string, projectId: string, path: string, action: GitIndexAction) {
-    return this._request(id, '/index', 'POST', { projectId, path, action });
+    return this._request<WorkspaceChangesSnapshot>(id, '/index', 'POST', {
+      projectId,
+      path,
+      action,
+    });
+  }
+
+  changeAllIndex(id: string, projectId: string, action: GitIndexAction, directory?: string) {
+    return this._request<WorkspaceChangesSnapshot>(id, '/index-all', 'POST', {
+      projectId,
+      action,
+      directory,
+    });
   }
 
   commit(id: string, input: WorkspaceCommitInput) {

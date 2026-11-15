@@ -4,6 +4,7 @@ import { GitIndexAction, type GitFileChange } from '@glink/protocol/git';
 import DiffTree from '../diff-tree.vue';
 import { gitRepoServiceKey } from '../../git/git-repo-service';
 import { gitChangesTreeStateKey } from '../../git/git-changes-tree-state-key';
+import { GitIndexScope, type GitIndexTarget } from '../../git/git-index-target';
 
 const props = defineProps<{
   items: GitFileChange[];
@@ -16,14 +17,14 @@ const props = defineProps<{
 }>();
 const emit = defineEmits<{
   select: [file: GitFileChange];
-  changeIndex: [file: GitFileChange, action: GitIndexAction];
+  changeIndex: [target: GitIndexTarget, action: GitIndexAction];
 }>();
 const action = computed(() => props.staged ? GitIndexAction.unstage : GitIndexAction.stage);
 const repo = inject(gitRepoServiceKey)!;
 
 function changeIndex(file: GitFileChange) {
   if (!props.busy && !props.loading && (props.staged || !file.stageBlockedReason)) {
-    emit('changeIndex', file, action.value);
+    emit('changeIndex', { scope: GitIndexScope.file, path: file.path }, action.value);
   }
 }
 </script>
@@ -45,8 +46,13 @@ function changeIndex(file: GitFileChange) {
         :data-ready="ready"
         :model-value="selectedPath"
         :disabled-paths="pendingPath ? [pendingPath] : undefined"
+        :index-action="action"
+        :index-disabled="busy || loading"
         @select="emit('select', $event)"
         @activate="changeIndex"
+        @index-directory="
+          emit('changeIndex', { scope: GitIndexScope.directory, path: $event }, action)
+        "
       >
         <template #actions="{ item }">
           <button

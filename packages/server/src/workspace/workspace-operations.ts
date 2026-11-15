@@ -1,3 +1,4 @@
+import { runGit } from '../git/run-git.ts';
 import { relative } from 'node:path';
 import { GitIndexAction, type GitCommit } from '@glink/protocol/git';
 import {
@@ -5,21 +6,22 @@ import {
   type WorkspaceCommit,
   type WorkspaceCommitInput,
   type WorkspaceCommitResult,
-  type WorkspaceDocument,
+  type WorkspaceProject,
   type WorkspaceProjectStatus,
 } from '@glink/protocol/workspace';
-import { changeIndex, commitWorktree } from '../git/worktree.ts';
-import { readProjectCommits, readProjectStatus, runWorkspaceGit } from './workspace-git.ts';
+import { GitIndexTransaction } from '../git/worktree.ts';
+import { readProjectCommits, readProjectStatus } from './workspace-git.ts';
 import { WorkspaceError, WorkspaceStore } from './workspace-store.ts';
 
 export async function workspaceStatuses(
-  document: WorkspaceDocument,
+  projects: readonly WorkspaceProject[], signal?: AbortSignal,
 ): Promise<WorkspaceProjectStatus[]> {
   return Promise.all(
-    document.projects.map(async (project) => {
+    projects.map(async (project) => {
       try {
-        return await readProjectStatus(project);
+        return await readProjectStatus(project, signal);
       } catch (error: unknown) {
+        signal?.throwIfAborted();
         return {
           projectId: project.id,
           staged: [],
@@ -32,16 +34,19 @@ export async function workspaceStatuses(
   );
 }
 
-export async function workspaceHistory(document: WorkspaceDocument) {
+export async function workspaceHistory(
+  projects: readonly WorkspaceProject[], signal?: AbortSignal,
+) {
   const errors: Array<{ projectId: string; error: string }> = [];
   const lists = await Promise.all(
-    document.projects.map(async (project) => {
+    projects.map(async (project) => {
       try {
-        return (await readProjectCommits(project)).map((commit) => ({
+        return (await readProjectCommits(project, signal)).map((commit) => ({
           ...commit,
           projectId: project.id,
         }));
       } catch (error: unknown) {
+        signal?.throwIfAborted();
         errors.push({
           projectId: project.id,
           error: error instanceof Error ? error.message : String(error),
@@ -74,72 +79,74 @@ export async function commitWorkspace(
   id: string,
   input: WorkspaceCommitInput,
 ) {
-  return store.mutate(async () => {
+  if (
+    !Array.isArray(input.projectIds)
+    || !Array.isArray(input.expected)
+    || typeof input.message !== 'string'
+    || !input.message.trim()
+    || (input.amend !== undefined && typeof input.amend !== 'boolean')
+  ) {
+    throw new WorkspaceError('Select projects and enter a commit message.');
+  }
+  const document = await store.get(id);
+  const selected = new Set<string>(input.projectIds);
+  const snapshots = new Map<string, WorkspaceProjectStatus>();
+  for (const projectId of selected) {
+    const project = store.project(document, projectId);
+    const status = await readProjectStatus(project);
+    const expected = input.expected.find((entry) => entry.projectId === projectId);
     if (
-      !Array.isArray(input.projectIds)
-      || !Array.isArray(input.expected)
-      || typeof input.message !== 'string'
-      || !input.message.trim()
-      || (input.amend !== undefined && typeof input.amend !== 'boolean')
+      !expected
+      || status.head !== expected.head
+      || status.indexFingerprint !== expected.indexFingerprint
+      || (input.amend && status.baseCommit !== expected.baseCommit)
     ) {
-      throw new WorkspaceError('Select projects and enter a commit message.');
+      throw new WorkspaceError(
+        `${project.name} changed. Refresh and review its staged changes.`,
+        409,
+      );
     }
-    const document = await store.get(id);
-    const selected = new Set<string>(input.projectIds);
-    const snapshots = new Map<string, WorkspaceProjectStatus>();
-    for (const projectId of selected) {
-      const project = store.project(document, projectId);
-      const status = await readProjectStatus(project);
-      const expected = input.expected.find((entry) => entry.projectId === projectId);
-      if (
-        !expected
-        || status.head !== expected.head
-        || status.indexFingerprint !== expected.indexFingerprint
-        || (input.amend && status.baseCommit !== expected.baseCommit)
-      ) {
-        throw new WorkspaceError(
-          `${project.name} changed. Refresh and review its staged changes.`,
-          409,
-        );
-      }
-      snapshots.set(projectId, status);
-    }
-    if (input.amend) {
-      // Per-project rules apply to every selection independently of the current count limit.
-      for (const [projectId, status] of snapshots) {
-        if (status.amendBlockedReason) {
-          const project = store.project(document, projectId);
-          throw new WorkspaceError(`${project.name}: ${status.amendBlockedReason}`, 409);
-        }
-      }
-      if (selected.size !== 1) {
-        throw new WorkspaceError('修订提交目前只能选择一个 Project。', 409);
+    snapshots.set(projectId, status);
+  }
+  if (input.amend) {
+    // Per-project rules apply to every selection independently of the current count limit.
+    for (const [projectId, status] of snapshots) {
+      if (status.amendBlockedReason) {
+        const project = store.project(document, projectId);
+        throw new WorkspaceError(`${project.name}: ${status.amendBlockedReason}`, 409);
       }
     }
-    const ordered: string[] = [];
-    const visited = new Set<string>();
+    if (selected.size !== 1) {
+      throw new WorkspaceError('修订提交目前只能选择一个 Project。', 409);
+    }
+  }
+  const ordered: string[] = [];
+  const visited = new Set<string>();
 
-    function visit(projectId: string) {
-      if (visited.has(projectId)) {
-        return;
-      }
-      visited.add(projectId);
-      document.connections
-        .filter((edge) => edge.from === projectId)
-        .forEach((edge) => visit(edge.to));
-      if (selected.has(projectId)) {
-        ordered.push(projectId);
-      }
+  function visit(projectId: string) {
+    if (visited.has(projectId)) {
+      return;
     }
+    visited.add(projectId);
+    document.connections
+      .filter((edge) => edge.from === projectId)
+      .forEach((edge) => visit(edge.to));
+    if (selected.has(projectId)) {
+      ordered.push(projectId);
+    }
+  }
 
-    selected.forEach(visit);
-    const result: WorkspaceCommitResult = { committed: [], skipped: [] };
-    for (const projectId of ordered) {
-      const project = store.project(document, projectId);
-      try {
+  selected.forEach(visit);
+  const result: WorkspaceCommitResult = { committed: [], skipped: [] };
+  for (const projectId of ordered) {
+    const project = store.project(document, projectId);
+    try {
+      await GitIndexTransaction.run(project.worktreePath, async (index) => {
         const before = snapshots.get(projectId)!;
-        const current = await readProjectStatus(project);
-        if (current.head !== before.head || current.indexFingerprint !== before.indexFingerprint) {
+        const currentProject = store.project(await store.get(id), projectId);
+        const current = await readProjectStatus(currentProject);
+        if (current.head !== before.head || current.indexFingerprint !== before.indexFingerprint
+          || (input.amend && current.baseCommit !== before.baseCommit)) {
           throw new WorkspaceError(`${project.name} changed during the workspace commit.`, 409);
         }
         for (const edge of document.connections.filter(
@@ -153,7 +160,7 @@ export async function commitWorkspace(
           if (current.unstaged.some((file) => file.path === path && file.stageBlockedReason)) {
             continue;
           }
-          const indexEntry = await runWorkspaceGit(project.worktreePath, [
+          const indexEntry = await runGit(project.worktreePath, [
             'ls-files',
             '--stage',
             '--',
@@ -165,26 +172,26 @@ export async function commitWorkspace(
               409,
             );
           }
-          await changeIndex(project.worktreePath, path, GitIndexAction.stage);
+          await index.change(path, GitIndexAction.stage);
         }
-        if (!input.amend && !(await readProjectStatus(project)).staged.length) {
+        if (!input.amend && !(await index.readChanges()).staged.length) {
           result.skipped.push(projectId);
-          continue;
+          return;
         }
-        await commitWorktree(project.worktreePath, {
+        await index.commit({
           message: input.message.trim(),
           amend: input.amend ?? false,
         });
-        const sha = (await runWorkspaceGit(project.worktreePath, ['rev-parse', 'HEAD'])).trim();
+        const sha = (await runGit(project.worktreePath, ['rev-parse', 'HEAD'])).trim();
         result.committed.push({ projectId, sha });
-      } catch (error: unknown) {
-        result.failed = {
-          projectId,
-          error: error instanceof Error ? error.message : String(error),
-        };
-        break;
-      }
+      });
+    } catch (error: unknown) {
+      result.failed = {
+        projectId,
+        error: error instanceof Error ? error.message : String(error),
+      };
+      break;
     }
-    return result;
-  });
+  }
+  return result;
 }

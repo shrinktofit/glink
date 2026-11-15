@@ -1,12 +1,15 @@
 <script setup lang="ts">
+import { GitIndexAction } from '@glink/protocol/git';
 import { nextTick, onMounted, onUnmounted, ref, useTemplateRef, watch } from 'vue';
 const props = defineProps<{
   path: string;
   repoPath: string;
   x: number;
   y: number;
+  indexAction?: GitIndexAction;
+  indexDisabled?: boolean;
 }>();
-const emit = defineEmits<{ close: [] }>();
+const emit = defineEmits<{ close: []; index: [] }>();
 const menu = useTemplateRef<HTMLDivElement>('menu');
 const position = ref({ left: '0px', top: '0px' });
 const error = ref('');
@@ -24,7 +27,7 @@ async function place() {
 onMounted(() => {
   menu.value!.showPopover();
   void place();
-  menu.value!.querySelector('button')!.focus();
+  menu.value!.querySelector<HTMLButtonElement>('button:not(:disabled)')!.focus();
   window.addEventListener('resize', () => emit('close'), { signal: events.signal });
   document.addEventListener('scroll', () => emit('close'), {
     capture: true,
@@ -71,7 +74,7 @@ async function copy(absolute: boolean) {
 }
 
 function navigate(event: KeyboardEvent) {
-  const buttons = [...menu.value!.querySelectorAll('button')];
+  const buttons = [...menu.value!.querySelectorAll<HTMLButtonElement>('button:not(:disabled)')];
   const index = buttons.indexOf(document.activeElement as HTMLButtonElement);
   if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {
     event.preventDefault();
@@ -83,7 +86,7 @@ function navigate(event: KeyboardEvent) {
 <template>
   <div
     ref="menu"
-    class="git-file-menu"
+    class="git-file-menu command-menu"
     popover="auto"
     role="menu"
     aria-label="文件操作"
@@ -91,6 +94,17 @@ function navigate(event: KeyboardEvent) {
     @toggle="$event.newState === 'closed' && emit('close')"
     @keydown="navigate"
   >
+    <template v-if="indexAction">
+      <button
+        role="menuitem"
+        :disabled="indexDisabled"
+        :aria-disabled="indexDisabled || undefined"
+        @click="!indexDisabled && emit('index')"
+      >
+        {{ indexAction === GitIndexAction.stage ? '暂存' : '取消暂存' }}
+      </button>
+      <hr role="separator">
+    </template>
     <button
       role="menuitem"
       @click="copy(false)"
@@ -117,28 +131,6 @@ function navigate(event: KeyboardEvent) {
   position: fixed;
   inset: auto;
   margin: 0;
-  min-width: 13em;
-  max-width: min(28em, 95vw);
-  padding: 0.4em;
-  background: var(--ws-surface, var(--surface));
-  color: var(--ws-text, var(--text));
-  border: 1px solid var(--ws-line, var(--divider));
-  border-radius: 0.6em;
-  box-shadow: 0 0.5em 2em #242a3420;
-  font:
-    0.8125rem/1.45 'Segoe UI',
-    sans-serif;
-}
-button {
-  display: block;
-  width: 100%;
-  padding: 0.55em 0.7em;
-  text-align: left;
-  border-radius: 0.35em;
-}
-button:hover,
-button:focus-visible {
-  background: var(--ws-active, var(--hover));
 }
 .copy-error {
   color: var(--ws-red, var(--error));

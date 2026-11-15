@@ -1,3 +1,4 @@
+import { runGit } from '../git/run-git.ts';
 import { randomUUID } from 'node:crypto';
 import { mkdir, readFile, rename, unlink, writeFile } from 'node:fs/promises';
 import { basename, join } from 'node:path';
@@ -16,7 +17,6 @@ import {
   hasWorktree,
   inspectWorktree,
   readProjectBranches,
-  runWorkspaceGit,
 } from './workspace-git.ts';
 
 export class WorkspaceError extends Error {
@@ -393,7 +393,7 @@ export class WorkspaceStore {
   private async _commitSha(path: string, revision: string) {
     try {
       return (
-        await runWorkspaceGit(path, [
+        await runGit(path, [
           'rev-parse',
           '--quiet',
           '--verify',

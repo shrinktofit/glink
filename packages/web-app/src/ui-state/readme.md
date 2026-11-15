@@ -1,4 +1,4 @@
-# Expansion view state
+# Browser-local UI state
 
 Expansion is a disposable browser-local view snapshot, separate from workspace YAML and Git data.
 
@@ -19,3 +19,10 @@ Expansion is a disposable browser-local view snapshot, separate from workspace Y
 Pinia provides in-app sharing; storage events do not drive live views. Reloading reads the browser's
 latest saved cache. Evicting a snapshot never resets an already mounted view. VueUse reports cache
 IO errors; the live expansion state does not depend on a successful storage write.
+
+Workspace commit filters are durable preferences in `workspace-commit-filter-store.ts`, independent
+of the disposable expansion cache. Pinia and VueUse store excluded project IDs under
+`glink.workspace-commit-filter.v1`, scoped by workspace ID. No exclusion means selected, so new
+projects default to selected and an explicitly empty selection survives reload. Complete workspace
+documents prune removed projects; successful catalog reads prune removed workspaces. Renames retain
+the same IDs and preferences. Outline browsing selection does not change this filter.

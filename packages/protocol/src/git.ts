@@ -3,6 +3,7 @@ export const commitGraphLimit = 500;
 export const worktreeStatusPath = '/api/git/status';
 export const fileDiffPath = '/api/git/diff';
 export const gitIndexPath = '/api/git/index';
+export const gitIndexAllPath = '/api/git/index-all';
 export const gitCommitPath = '/api/git/commit';
 export const commitDetailPath = '/api/git/commit-detail';
 export const commitDiffPath = '/api/git/commit-diff';
@@ -78,12 +79,20 @@ export interface GitFileChange {
   stageBlockedReason?: string;
 }
 
-export interface WorktreeStatus {
+export interface ChangesSnapshot {
   unstaged: GitFileChange[];
   staged: GitFileChange[];
-  headMessage?: string;
+  head?: string;
+  branch?: string;
+  indexFingerprint: string;
+  /** Present when index membership may have changed; full project reads always include it. */
+  submodulePaths?: string[];
   commitBlockedReason?: string;
   amendBlockedReason?: string;
+}
+
+export interface WorktreeStatus extends ChangesSnapshot {
+  headMessage?: string;
 }
 
 export interface FileDiffResponse {

@@ -1,6 +1,6 @@
 <script setup lang="ts" generic="T extends FileTreeEntry">
 import { computed } from 'vue';
-import type { FileTreeEntry } from './file-tree';
+import { fileTreePathsOverlap, type FileTreeEntry } from './file-tree';
 import TreeDisclosure from './tree-disclosure.vue';
 import { useExpansionState } from '../ui-state/use-expansion-state';
 
@@ -22,9 +22,16 @@ const selected = defineModel<string>();
 const emit = defineEmits<{
   select: [item: T];
   activate: [item: T];
+  activateDirectory: [path: string];
   contextmenu: [event: MouseEvent, item: T];
+  directoryContextmenu: [event: MouseEvent, path: string];
 }>();
 const disabled = computed(() => new Set(props.disabledPaths));
+
+function isDisabled(path: string) {
+  return disabled.value.has(path)
+    || props.disabledPaths.some((pending) => fileTreePathsOverlap(path, pending));
+}
 
 interface TreeNode {
   path: string;
@@ -122,7 +129,7 @@ const rows = computed(() => {
 function select(index: number) {
   const row = rows.value[index];
   const node = row.node;
-  if (disabled.value.has(node.path)) {
+  if (isDisabled(node.path)) {
     return;
   }
   if (node.children.size) {
@@ -134,15 +141,27 @@ function select(index: number) {
 }
 
 function contextMenu(event: MouseEvent, node: TreeNode) {
-  if (disabled.value.has(node.path)) {
+  if (isDisabled(node.path)) {
     event.preventDefault();
     event.stopPropagation();
     return;
   }
-  if (!node.item) {
+  if (node.children.size) {
+    emit('directoryContextmenu', event, node.path);
+  } else if (node.item) {
+    emit('contextmenu', event, node.item);
+  }
+}
+
+function activate(event: MouseEvent, node: TreeNode) {
+  if (event.button !== 0 || isDisabled(node.path)) {
     return;
   }
-  emit('contextmenu', event, node.item);
+  if (node.children.size) {
+    emit('activateDirectory', node.path);
+  } else if (node.item) {
+    emit('activate', node.item);
+  }
 }
 
 function navigate(event: KeyboardEvent, index: number) {
@@ -150,6 +169,9 @@ function navigate(event: KeyboardEvent, index: number) {
   const buttons = tree.querySelectorAll<HTMLButtonElement>('.entry');
   const row = rows.value[index];
   const node = row.node;
+  if (isDisabled(node.path)) {
+    return;
+  }
   let target = index;
   switch (event.key) {
   case 'ArrowDown':
@@ -204,7 +226,7 @@ function navigate(event: KeyboardEvent, index: number) {
       v-for="({ node, name, depth, expanded }, index) in rows"
       :key="node.path"
       class="tree-row"
-      :class="{ selected: selected === node.path, disabled: disabled.has(node.path) }"
+      :class="{ selected: selected === node.path, disabled: isDisabled(node.path) }"
       :style="{ paddingLeft: `${0.5 + depth}em` }"
       @keydown="navigate($event, index)"
       @contextmenu="contextMenu($event, node)"
@@ -213,17 +235,14 @@ function navigate(event: KeyboardEvent, index: number) {
         class="entry"
         type="button"
         role="treeitem"
-        :disabled="disabled.has(node.path)"
-        :aria-disabled="disabled.has(node.path) || undefined"
+        :disabled="isDisabled(node.path)"
+        :aria-disabled="isDisabled(node.path) || undefined"
         :aria-level="depth + 1"
         :aria-expanded="node.children.size ? expanded : undefined"
         :aria-selected="!node.children.size ? selected === node.path : undefined"
         :title="node.path"
         @click="select(index)"
-        @dblclick="
-          node.item && !disabled.has(node.path)
-            && $event.button === 0 && emit('activate', node.item)
-        "
+        @dblclick="activate($event, node)"
       >
         <span class="prefix">
           <tree-disclosure

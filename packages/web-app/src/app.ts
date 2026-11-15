@@ -9,9 +9,11 @@ import { GitService } from './git/git-service';
 import { GitRepoService, gitRepoServiceKey } from './git/git-repo-service';
 import './styles.less';
 import './workspace/workspace-theme.less';
+import './styles/command-menu.less';
 import { appKey } from './app-context';
 import { createGlinkRouter } from './router';
 import { WorkspaceService } from './workspace/workspace-service';
+import { useWorkspaceCommitFilterStore } from './ui-state/workspace-commit-filter-store';
 
 export class App {
   static async create() {
@@ -32,6 +34,7 @@ export class App {
     const catalog = await this.workspaceService.catalog(signal);
     if (!signal?.aborted) {
       this.catalog.value = catalog;
+      this._commitFilter.pruneWorkspaces(catalog.workspaces.map((workspace) => workspace.id));
     }
   }
 
@@ -45,10 +48,15 @@ export class App {
     );
     this.router = createGlinkRouter(this.gitRepoService.repoPath);
     this.vueApp = createApp(GlinkApp);
-    this.vueApp.use(createPinia());
+    const pinia = createPinia();
+    this.vueApp.use(pinia);
+    this._commitFilter = useWorkspaceCommitFilterStore(pinia);
+    this._commitFilter.pruneWorkspaces(catalog.workspaces.map((workspace) => workspace.id));
     this.vueApp.use(createVuetify({ theme: { defaultTheme: 'light' } }));
     this.vueApp.use(this.router);
     this.vueApp.provide(gitRepoServiceKey, this.gitRepoService);
     this.vueApp.provide(appKey, this);
   }
+
+  private readonly _commitFilter: ReturnType<typeof useWorkspaceCommitFilterStore>;
 }

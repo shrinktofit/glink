@@ -14,12 +14,15 @@ import WorkspaceProjectEditor from './workspace-project-editor.vue';
 const props = defineProps<{
   workspace: WorkspaceDocument;
   statuses: WorkspaceProjectStatus[];
+  selected: readonly string[];
   service: WorkspaceService;
   busy: boolean;
 }>();
-const selected = defineModel<string>('selected');
 const expanded = defineModel<boolean>('expanded');
-const emit = defineEmits<{ changed: [workspace: WorkspaceDocument] }>();
+const emit = defineEmits<{
+  changed: [workspace: WorkspaceDocument];
+  select: [projectId: string, event: MouseEvent];
+}>();
 const editing = ref<WorkspaceProject>();
 const context = ref<{ id?: string; x: number; y: number }>();
 const addDialog = useTemplateRef<HTMLDialogElement>('add-dialog');
@@ -49,7 +52,14 @@ function state(id: string) {
 function projectTitle(project: WorkspaceProject) {
   const value = status(project.id);
   const clean = value?.error ?? (state(project.id) === '●' ? 'Not clean' : 'Clean');
-  return `${project.worktreePath}\n${clean} · ${project.settled ? 'Settled' : 'Unsettled'}`;
+  const lines = [
+    project.worktreePath,
+    `${clean} · ${project.settled ? 'Settled' : 'Unsettled'}`,
+  ];
+  if (value && !value.error && value.baseCommit === project.baseCommit && value.aheadCount) {
+    lines.push(`Ahead ${value.aheadCount} ${value.aheadCount === 1 ? 'commit' : 'commits'}`);
+  }
+  return lines.join('\n');
 }
 
 function bindingChanged(project: WorkspaceProject) {
@@ -148,14 +158,15 @@ defineExpose({ edit });
         v-for="project in workspace.projects"
         :key="project.id"
         class="project-row"
-        :class="{ selected: selected === project.id }"
+        :class="{ selected: selected.includes(project.id) }"
         @contextmenu.stop.prevent="menu($event, project.id)"
       >
         <button
           class="project-pick"
           :class="{ 'binding-changed': bindingChanged(project) }"
           :title="projectTitle(project)"
-          @click="selected = project.id"
+          :aria-pressed="selected.includes(project.id)"
+          @click="emit('select', project.id, $event)"
         >
           <span
             class="clean-state"
@@ -213,7 +224,7 @@ defineExpose({ edit });
         @click="context = undefined"
       />
       <div
-        class="context ws-panel"
+        class="context command-menu"
         role="menu"
         :style="{ left: `${context.x}px`, top: `${context.y}px` }"
       >
@@ -224,6 +235,7 @@ defineExpose({ edit });
         >
           添加 Project{{ selectedProject ? ' 为依赖' : '' }}
         </button><template v-if="selectedProject">
+          <hr role="separator">
           <router-link
             v-if="!status(selectedProject.id)?.error"
             role="menuitem"
@@ -249,7 +261,9 @@ defineExpose({ edit });
             "
           >
             编辑 Project
-          </button><button
+          </button>
+          <hr role="separator">
+          <button
             role="menuitem"
             :disabled="busy || working || locked(selectedProject.id)"
             :title="locked(selectedProject.id) ? '请先移除父 Project' : '仅移除工作区关联'"
@@ -423,16 +437,5 @@ footer {
 .context {
   position: fixed;
   z-index: 61;
-  min-width: 16em;
-  padding: 0.4em;
-  box-shadow: 0 0.5em 2em #242a3420;
-}
-.context a { color: inherit; text-decoration: none; border-radius: .4em; }
-.context a:hover { background: var(--ws-active); }
-.context button, .context a {
-  display: block;
-  width: 100%;
-  text-align: left;
-  padding: 0.6em;
 }
 </style>
