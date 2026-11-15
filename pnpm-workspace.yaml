@@ -2,6 +2,8 @@ packages:
   - 'packages/*'
 
 catalog:
+  '@vueuse/core': '^15.0.0'
+  'pinia': '^4.1.0'
   'diff': '^9.0.0'
   '@types/node': '^26.6.6'
   '@vitejs/plugin-vue': '^6.0.11'

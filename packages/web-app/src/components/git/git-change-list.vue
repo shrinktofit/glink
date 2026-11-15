@@ -3,6 +3,7 @@ import { computed, inject } from 'vue';
 import { GitIndexAction, type GitFileChange } from '@glink/protocol/git';
 import DiffTree from '../diff-tree.vue';
 import { gitRepoServiceKey } from '../../git/git-repo-service';
+import { gitChangesTreeStateKey } from '../../git/git-changes-tree-state-key';
 
 const props = defineProps<{
   items: GitFileChange[];
@@ -11,6 +12,7 @@ const props = defineProps<{
   pendingPath?: string;
   busy: boolean;
   loading: boolean;
+  ready: boolean;
 }>();
 const emit = defineEmits<{
   select: [file: GitFileChange];
@@ -39,6 +41,8 @@ function changeIndex(file: GitFileChange) {
       <diff-tree
         :items="items"
         :repo-path="repo.repoPath"
+        :state-key="gitChangesTreeStateKey(repo.repoPath, staged)"
+        :data-ready="ready"
         :model-value="selectedPath"
         :disabled-paths="pendingPath ? [pendingPath] : undefined"
         @select="emit('select', $event)"

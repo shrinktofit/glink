@@ -10,8 +10,10 @@
   },
   "dependencies": {
     "@glink/protocol": "workspace:*",
+    "@vueuse/core": "catalog:",
     "diff": "catalog:",
     "monaco-editor": "catalog:",
+    "pinia": "catalog:",
     "vue": "catalog:",
     "vue-router": "catalog:",
     "vuetify": "catalog:"

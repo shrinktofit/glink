@@ -1,17 +1,22 @@
 <script setup lang="ts" generic="T extends FileTreeEntry">
-import { computed, ref } from 'vue';
+import { computed } from 'vue';
 import type { FileTreeEntry } from './file-tree';
 import TreeDisclosure from './tree-disclosure.vue';
+import { useExpansionState } from '../ui-state/use-expansion-state';
 
 const props = withDefaults(defineProps<{
   items: readonly T[];
   compactFolders?: boolean;
   defaultExpanded?: boolean;
   disabledPaths?: readonly string[];
+  stateKey?: string;
+  dataReady?: boolean;
 }>(), {
   compactFolders: true,
   defaultExpanded: true,
   disabledPaths: () => [],
+  stateKey: undefined,
+  dataReady: true,
 });
 const selected = defineModel<string>();
 const emit = defineEmits<{
@@ -19,12 +24,7 @@ const emit = defineEmits<{
   activate: [item: T];
   contextmenu: [event: MouseEvent, item: T];
 }>();
-const expanded = ref(new Map<string, boolean>());
 const disabled = computed(() => new Set(props.disabledPaths));
-
-function isExpanded(path: string) {
-  return expanded.value.get(path) ?? props.defaultExpanded;
-}
 
 interface TreeNode {
   path: string;
@@ -33,7 +33,7 @@ interface TreeNode {
   item?: T;
 }
 
-const rows = computed(() => {
+const root = computed(() => {
   const root = new Map<string, TreeNode>();
   for (const item of props.items) {
     let children = root;
@@ -50,7 +50,39 @@ const rows = computed(() => {
       children = node.children;
     });
   }
-  const result: Array<{ node: TreeNode; name: string; depth: number }> = [];
+  return root;
+});
+
+const folderPaths = computed(() => {
+  const paths: string[] = [];
+
+  function visit(children: Map<string, TreeNode>) {
+    for (const node of children.values()) {
+      if (node.children.size) {
+        paths.push(node.path);
+        visit(node.children);
+      }
+    }
+  }
+
+  visit(root.value);
+  return paths;
+});
+const { isExpanded, setExpanded } = useExpansionState(
+  () => props.stateKey,
+  folderPaths,
+  () => props.dataReady,
+  () => props.defaultExpanded,
+);
+
+const rows = computed(() => {
+  const result: Array<{
+    node: TreeNode;
+    name: string;
+    depth: number;
+    paths: string[];
+    expanded: boolean;
+  }> = [];
 
   function append(children: Map<string, TreeNode>, depth: number) {
     const nodes = [...children.values()].sort((a, b) => {
@@ -59,6 +91,7 @@ const rows = computed(() => {
     for (const start of nodes) {
       let node = start;
       let name = node.name;
+      const paths = [node.path];
       while (props.compactFolders && !node.item && node.children.size === 1) {
         const child = node.children.values().next().value!;
         if (child.item || !child.children.size) {
@@ -66,24 +99,34 @@ const rows = computed(() => {
         }
         node = child;
         name += `/${node.name}`;
+        paths.push(node.path);
       }
-      result.push({ node, name, depth });
-      if (isExpanded(node.path)) {
+      const expanded = paths.every(isExpanded);
+      result.push({
+        node,
+        name,
+        depth,
+        paths,
+        expanded,
+      });
+      if (expanded) {
         append(node.children, depth + 1);
       }
     }
   }
 
-  append(root, 0);
+  append(root.value, 0);
   return result;
 });
 
-function select(node: TreeNode) {
+function select(index: number) {
+  const row = rows.value[index];
+  const node = row.node;
   if (disabled.value.has(node.path)) {
     return;
   }
   if (node.children.size) {
-    expanded.value.set(node.path, !isExpanded(node.path));
+    setExpanded(row.paths, !row.expanded);
   } else if (node.item) {
     selected.value = node.path;
     emit('select', node.item);
@@ -105,7 +148,8 @@ function contextMenu(event: MouseEvent, node: TreeNode) {
 function navigate(event: KeyboardEvent, index: number) {
   const tree = (event.currentTarget as HTMLElement).parentElement!;
   const buttons = tree.querySelectorAll<HTMLButtonElement>('.entry');
-  const node = rows.value[index].node;
+  const row = rows.value[index];
+  const node = row.node;
   let target = index;
   switch (event.key) {
   case 'ArrowDown':
@@ -121,15 +165,15 @@ function navigate(event: KeyboardEvent, index: number) {
     target = rows.value.length - 1;
     break;
   case 'ArrowRight':
-    if (node.children.size && !isExpanded(node.path)) {
-      expanded.value.set(node.path, true);
+    if (node.children.size && !row.expanded) {
+      setExpanded(row.paths, true);
     } else if (node.children.size) {
       target = index + 1;
     }
     break;
   case 'ArrowLeft':
-    if (node.children.size && isExpanded(node.path)) {
-      expanded.value.set(node.path, false);
+    if (node.children.size && row.expanded) {
+      setExpanded(row.paths, false);
     } else {
       let parentIndex = index - 1;
       while (parentIndex >= 0 && rows.value[parentIndex].depth >= rows.value[index].depth) {
@@ -157,7 +201,7 @@ function navigate(event: KeyboardEvent, index: number) {
     role="tree"
   >
     <div
-      v-for="({ node, name, depth }, index) in rows"
+      v-for="({ node, name, depth, expanded }, index) in rows"
       :key="node.path"
       class="tree-row"
       :class="{ selected: selected === node.path, disabled: disabled.has(node.path) }"
@@ -172,10 +216,10 @@ function navigate(event: KeyboardEvent, index: number) {
         :disabled="disabled.has(node.path)"
         :aria-disabled="disabled.has(node.path) || undefined"
         :aria-level="depth + 1"
-        :aria-expanded="node.children.size ? isExpanded(node.path) : undefined"
+        :aria-expanded="node.children.size ? expanded : undefined"
         :aria-selected="!node.children.size ? selected === node.path : undefined"
         :title="node.path"
-        @click="select(node)"
+        @click="select(index)"
         @dblclick="
           node.item && !disabled.has(node.path)
             && $event.button === 0 && emit('activate', node.item)
@@ -184,7 +228,7 @@ function navigate(event: KeyboardEvent, index: number) {
         <span class="prefix">
           <tree-disclosure
             v-if="node.children.size"
-            :expanded="isExpanded(node.path)"
+            :expanded="expanded"
           />
           <slot
             v-else

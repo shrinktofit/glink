@@ -1,4 +1,5 @@
 import { createApp, shallowRef, type App as VueApp } from 'vue';
+import { createPinia } from 'pinia';
 import type { Router } from 'vue-router';
 import type { GlinkCatalog } from '@glink/protocol/workspace';
 import { createVuetify } from 'vuetify';
@@ -44,6 +45,7 @@ export class App {
     );
     this.router = createGlinkRouter(this.gitRepoService.repoPath);
     this.vueApp = createApp(GlinkApp);
+    this.vueApp.use(createPinia());
     this.vueApp.use(createVuetify({ theme: { defaultTheme: 'light' } }));
     this.vueApp.use(this.router);
     this.vueApp.provide(gitRepoServiceKey, this.gitRepoService);

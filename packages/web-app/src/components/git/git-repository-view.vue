@@ -24,6 +24,7 @@ const view = ref(GitView.history);
 const sidebarWidth = ref(0.15);
 const overview = ref<RepositoryOverview>();
 const status = ref<WorktreeStatus>({ staged: [], unstaged: [] });
+const statusReady = ref(false);
 const loading = ref(true);
 const busy = ref(false);
 const pendingIndexPath = ref<string>();
@@ -67,6 +68,7 @@ async function refresh() {
   const [worktreeResult, overviewResult] = results;
   if (worktreeResult.status === 'fulfilled') {
     status.value = worktreeResult.value;
+    statusReady.value = true;
     const selected = selectedFile.value;
     if (selected) {
       const files = selected.staged ? status.value.staged : status.value.unstaged;
@@ -198,6 +200,7 @@ onBeforeUnmount(() => {
         v-model:description="description"
         v-model:amend="amend"
         :status="status"
+        :status-ready="statusReady"
         :selected="selectedFile"
         :pending-path="pendingIndexPath"
         :diff="diff"

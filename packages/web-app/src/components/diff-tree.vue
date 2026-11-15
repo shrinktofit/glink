@@ -10,7 +10,14 @@ const props = withDefaults(defineProps<{
   repoPath: string;
   compactFolders?: boolean;
   disabledPaths?: readonly string[];
-}>(), { compactFolders: true, disabledPaths: () => [] });
+  stateKey?: string;
+  dataReady?: boolean;
+}>(), {
+  compactFolders: true,
+  disabledPaths: () => [],
+  stateKey: undefined,
+  dataReady: true,
+});
 const selected = defineModel<string>();
 const emit = defineEmits<{ select: [item: GitFileChange]; activate: [item: GitFileChange] }>();
 const context = ref<{ path: string; x: number; y: number }>();
@@ -48,6 +55,8 @@ const markers: Record<GitDiffType, { icon: string; label: string; color: string 
     :items="items"
     :compact-folders="compactFolders"
     :disabled-paths="disabledPaths"
+    :state-key="stateKey"
+    :data-ready="dataReady"
     @select="emit('select', $event)"
     @activate="emit('activate', $event)"
     @contextmenu="openMenu"

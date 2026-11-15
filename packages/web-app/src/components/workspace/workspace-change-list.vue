@@ -1,9 +1,12 @@
 <script setup lang="ts">
-import { computed, ref } from 'vue';
+import { computed, watch } from 'vue';
 import type { GitFileChange } from '@glink/protocol/git';
 import type { WorkspaceDocument, WorkspaceProjectStatus } from '@glink/protocol/workspace';
 import DiffTree from '../diff-tree.vue';
 import TreeDisclosure from '../tree-disclosure.vue';
+import { useExpansionState } from '../../ui-state/use-expansion-state';
+import { useExpansionStateStore } from '../../ui-state/expansion-state-store';
+import { gitChangesTreeStateKey } from '../../git/git-changes-tree-state-key';
 const props = defineProps<{
   workspace: WorkspaceDocument;
   statuses: WorkspaceProjectStatus[];
@@ -36,14 +39,24 @@ function changeIndex(projectId: string, file: GitFileChange) {
   }
 }
 
-const collapsedProjects = ref(new Set<string>());
+const { isExpanded, setExpanded } = useExpansionState(
+  () => JSON.stringify(['workspace-change-groups', props.workspace.id, props.staged]),
+  () => props.workspace.projects.map((project) => project.id),
+  true,
+);
+const cache = useExpansionStateStore();
+watch(() => [props.statuses, props.workspace.projects], () => {
+  // Empty successful lists have no mounted tree to capture a new snapshot.
+  for (const project of props.workspace.projects) {
+    const status = props.statuses.find((item) => item.projectId === project.id);
+    if (status && !status.error && !(props.staged ? status.staged : status.unstaged).length) {
+      cache.remove(gitChangesTreeStateKey(project.worktreePath, props.staged));
+    }
+  }
+}, { immediate: true });
 
 function toggleProject(id: string) {
-  if (collapsedProjects.value.has(id)) {
-    collapsedProjects.value.delete(id);
-  } else {
-    collapsedProjects.value.add(id);
-  }
+  setExpanded([id], !isExpanded(id));
 }
 </script>
 <template>
@@ -63,16 +76,16 @@ function toggleProject(id: string) {
         <h3 :title="group.project.worktreePath">
           <button
             class="group-toggle"
-            :aria-expanded="!collapsedProjects.has(group.project.id)"
+            :aria-expanded="isExpanded(group.project.id)"
             :aria-controls="`changes-${staged}-${group.project.id}`"
             @click="toggleProject(group.project.id)"
           >
-            <tree-disclosure :expanded="!collapsedProjects.has(group.project.id)" />
+            <tree-disclosure :expanded="isExpanded(group.project.id)" />
             {{ group.project.name }}<span class="count muted">{{ group.files.length }}</span>
           </button>
         </h3>
         <div
-          v-show="!collapsedProjects.has(group.project.id)"
+          v-show="isExpanded(group.project.id)"
           :id="`changes-${staged}-${group.project.id}`"
         >
           <p
@@ -85,6 +98,8 @@ function toggleProject(id: string) {
           <diff-tree
             :items="group.files"
             :repo-path="group.project.worktreePath"
+            :state-key="gitChangesTreeStateKey(group.project.worktreePath, staged)"
+            :data-ready="!group.error"
             :disabled-paths="
               pendingIndex?.projectId === group.project.id ? [pendingIndex.path] : undefined
             "
