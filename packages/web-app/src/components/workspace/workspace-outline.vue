@@ -1,6 +1,7 @@
 <script setup lang="ts">
-import { computed, ref, useTemplateRef } from 'vue';
+import { computed, inject, ref, useTemplateRef } from 'vue';
 import { RouterLink } from 'vue-router';
+import { appKey } from '../../app-context';
 import { RouteName } from '../../router';
 import {
   WorkspaceConnectionKind,
@@ -18,6 +19,7 @@ const props = defineProps<{
   service: WorkspaceService;
   busy: boolean;
 }>();
+const app = inject(appKey)!;
 const expanded = defineModel<boolean>('expanded');
 const emit = defineEmits<{
   changed: [workspace: WorkspaceDocument];
@@ -270,6 +272,17 @@ defineExpose({ edit });
             @click="remove"
           >
             移除 Project
+          </button>
+          <button
+            role="menuitem"
+            class="danger"
+            :disabled="busy || working"
+            @click="
+              app.deleteWorktreePath.value = selectedProject.worktreePath;
+              context = undefined;
+            "
+          >
+            彻底删除工作树
           </button>
         </template>
       </div>

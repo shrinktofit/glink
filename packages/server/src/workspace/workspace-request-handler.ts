@@ -1,3 +1,6 @@
+import { WorktreeDeletionService } from './worktree-deletion-service.ts';
+import { WorktreeRemovalError } from '../git/worktree-removal.ts';
+import { worktreeDeletionPath, type WorktreePreflightEvent } from '@glink/protocol/git';
 import { readRequestSignal } from '../read-request-signal.ts';
 import { Buffer } from 'node:buffer';
 import type { IncomingMessage, ServerResponse } from 'node:http';
@@ -36,6 +39,7 @@ async function body<T>(request: IncomingMessage): Promise<T> {
 
 export async function createGlinkRequestHandler(options: { glinkHome: string }) {
   const store = await WorkspaceStore.open(options.glinkHome);
+  const deletion = new WorktreeDeletionService(store);
 
   async function readRequestedProjects(id: string, url: URL) {
     const document = await store.get(id);
@@ -52,8 +56,46 @@ export async function createGlinkRequestHandler(options: { glinkHome: string }) 
     const [id, section, projectId] = parts;
     const method = request.method;
     const signal = method === 'GET' ? readRequestSignal(response) : undefined;
+    if (url.pathname === `${worktreeDeletionPath}/preflight` && method === 'POST') {
+      const input = await body<{ worktreePath: string }>(request);
+      const cancellation = readRequestSignal(response);
+      response.writeHead(200, {
+        'Content-Type': 'application/x-ndjson; charset=utf-8',
+        'Cache-Control': 'no-cache, no-transform',
+        'X-Accel-Buffering': 'no',
+      });
+      response.flushHeaders();
+      const send = (event: WorktreePreflightEvent) => {
+        if (!response.destroyed) {
+          response.write(JSON.stringify(event) + '\n');
+        }
+      };
+      try {
+        const plan = await deletion.plan(input.worktreePath,
+          (progress) => send({ progress }),
+          cancellation);
+        send({ plan });
+      } catch (error: unknown) {
+        if (!cancellation.aborted) {
+          send({ error: String(error) });
+        }
+      }
+      response.end();
+      return;
+    }
     let result: unknown;
-    if (url.pathname === glinkStatePath && method === 'GET') {
+    if (url.pathname.startsWith(`${worktreeDeletionPath}/`) && method === 'POST') {
+      const input = await body<{ worktreePath: string; token: string }>(request);
+      if (url.pathname === `${worktreeDeletionPath}/plan`) {
+        result = await deletion.plan(input.worktreePath);
+      } else if (url.pathname === `${worktreeDeletionPath}/execute`) {
+        result = await deletion.safeDeleteWorktree(input.token);
+      } else if (url.pathname === `${worktreeDeletionPath}/cleanup`) {
+        result = await deletion.retryRecordCleanup(input.token);
+      } else {
+        throw new WorkspaceError('Endpoint not found.', 404);
+      }
+    } else if (url.pathname === glinkStatePath && method === 'GET') {
       result = await store.catalog();
     } else if (!id && method === 'POST') {
       result = await store.create(await body<CreateWorkspaceInput>(request));
@@ -129,7 +171,8 @@ export async function createGlinkRequestHandler(options: { glinkHome: string }) 
   return (request: IncomingMessage, response: ServerResponse): void => {
     const url = new URL(request.url ?? '/', 'http://localhost');
     if (
-      url.pathname !== glinkStatePath
+      !url.pathname.startsWith(`${worktreeDeletionPath}/`)
+      && url.pathname !== glinkStatePath
       && url.pathname !== workspacesPath
       && !url.pathname.startsWith(`${workspacesPath}/`)
     ) {
@@ -142,7 +185,7 @@ export async function createGlinkRequestHandler(options: { glinkHome: string }) 
       }
       const message = error instanceof Error ? error.message : String(error);
       response
-        .writeHead(error instanceof WorkspaceError
+        .writeHead(error instanceof WorkspaceError || error instanceof WorktreeRemovalError
           ? error.status
           : error instanceof GitIndexLockedError || error instanceof GitSubmoduleDirtyError
             ? 409

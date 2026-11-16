@@ -1,10 +1,16 @@
 <script setup lang="ts">
+import { inject } from 'vue';
+import { appKey } from '../../app-context';
 import GitWorktreePanel from './git-worktree-panel.vue';
+const app = inject(appKey)!;
 defineProps<{ worktreePath: string }>();
 </script>
 <template>
   <main class="repository-page">
-    <git-worktree-panel :worktree-path="worktreePath" />
+    <git-worktree-panel
+      :key="app.deletionVersion.value"
+      :worktree-path="worktreePath"
+    />
   </main>
 </template>
 <style scoped lang="less">

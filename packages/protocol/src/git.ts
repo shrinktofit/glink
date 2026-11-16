@@ -1,3 +1,4 @@
+export * from './worktree-deletion';
 export const commitGraphPath = '/api/git/commits';
 export const commitGraphLimit = 500;
 export const worktreeStatusPath = '/api/git/status';

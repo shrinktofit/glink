@@ -1,8 +1,12 @@
 <script setup lang="ts">
+import { inject } from 'vue';
+import { appKey } from './app-context';
+import WorktreeDeleteDialog from './components/git/worktree-delete-dialog.vue';
 import { RouterView, useRoute } from 'vue-router';
 import { RouteName } from './router';
 import GlinkMenu from './components/glink-menu.vue';
 const route = useRoute();
+const app = inject(appKey)!;
 </script>
 
 <template>
@@ -24,6 +28,12 @@ const route = useRoute();
         </header>
         <router-view />
       </div>
+      <worktree-delete-dialog
+        v-if="app.deleteWorktreePath.value"
+        :key="app.deleteWorktreePath.value"
+        :path="app.deleteWorktreePath.value"
+        @close="app.deleteWorktreePath.value = undefined"
+      />
     </v-main>
   </v-app>
 </template>

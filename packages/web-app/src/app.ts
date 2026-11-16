@@ -1,4 +1,4 @@
-import { createApp, shallowRef, type App as VueApp } from 'vue';
+import { createApp, shallowRef, ref, type App as VueApp } from 'vue';
 import { createPinia } from 'pinia';
 import type { Router } from 'vue-router';
 import type { GlinkCatalog } from '@glink/protocol/workspace';
@@ -22,6 +22,9 @@ export class App {
     app.vueApp.mount('#root');
     return app;
   }
+
+  readonly deleteWorktreePath = ref<string>();
+  readonly deletionVersion = ref(0);
 
   readonly catalog = shallowRef<GlinkCatalog>();
   readonly router: Router;

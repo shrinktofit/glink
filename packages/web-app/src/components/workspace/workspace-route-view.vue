@@ -13,8 +13,8 @@ const loading = ref(false);
 const error = ref('');
 
 watch(
-  () => props.name,
-  async (name) => {
+  () => [props.name, app.deletionVersion.value] as const,
+  async ([name]) => {
     const controller = new AbortController();
     onWatcherCleanup(() => controller.abort());
     workspace.value = undefined;

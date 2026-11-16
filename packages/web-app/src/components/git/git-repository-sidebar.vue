@@ -1,6 +1,7 @@
 <script setup lang="ts">
-import { computed, ref } from 'vue';
+import { computed, inject, ref } from 'vue';
 import type { GitReference, RepositoryOverview } from '@glink/protocol/git';
+import { appKey } from '../../app-context';
 import FileTree from '../file-tree.vue';
 import TreeDisclosure from '../tree-disclosure.vue';
 import { GitView } from './git-navigation';
@@ -13,6 +14,8 @@ const props = defineProps<{
   error?: string;
   canGoBack: boolean;
 }>();
+const app = inject(appKey)!;
+const context = ref<{ path: string; x: number; y: number }>();
 const view = defineModel<GitView>({ required: true });
 const emit = defineEmits<{
   refresh: [];
@@ -45,6 +48,14 @@ const stashes = computed(() => props.overview?.stashes.filter((entry) => {
 const submodules = computed(() => props.overview?.submodules.filter((entry) => {
   return entry.path.toLocaleLowerCase().includes(query.value);
 }) ?? []);
+
+function showWorktreeMenu(event: MouseEvent, path: string) {
+  context.value = {
+    path,
+    x: Math.min(event.clientX, window.innerWidth - 200),
+    y: Math.min(event.clientY, window.innerHeight - 60),
+  };
+}
 
 function selectReference(reference: GitReference) {
   emit('selectCommit', reference.sha);
@@ -113,6 +124,7 @@ function selectReference(reference: GitReference) {
           :class="{ current: worktree.current }"
           :title="worktree.path"
           :disabled="busy || worktree.prunable || worktree.bare"
+          @contextmenu.prevent="showWorktreeMenu($event, worktree.path)"
           @click="emit('openRepository', worktree.path)"
         >
           <span
@@ -211,10 +223,34 @@ function selectReference(reference: GitReference) {
         </button>
       </details>
     </div>
+    <template v-if="context">
+      <div
+        class="menu-dismiss"
+        @click="context = undefined"
+        @contextmenu.prevent="context = undefined"
+      />
+      <div
+        class="worktree-menu command-menu"
+        role="menu"
+        :style="{ left: `${context.x}px`, top: `${context.y}px` }"
+        @keydown.esc="context = undefined"
+      >
+        <button
+          role="menuitem"
+          class="danger"
+          :disabled="busy"
+          @click="app.deleteWorktreePath.value = context.path; context = undefined"
+        >
+          彻底删除工作树
+        </button>
+      </div>
+    </template>
   </aside>
 </template>
 
 <style scoped lang="less">
+.menu-dismiss { position: fixed; inset: 0; z-index: 40; }
+.worktree-menu { position: fixed; z-index: 41; }
 .repository-sidebar { display: flex;
   flex-direction: column;
   height: 100%;

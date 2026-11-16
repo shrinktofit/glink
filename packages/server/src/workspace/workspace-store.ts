@@ -352,6 +352,23 @@ export class WorkspaceStore {
     });
   }
 
+  /** Caller holds mutate(); persist only projects whose disk deletion has completed. */
+  async forgetDeletedWorktrees(document: WorkspaceDocument, paths: readonly string[]) {
+    const roots = paths.map((path) => path.replaceAll('\\', '/').toLowerCase());
+    const removed = new Set(document.projects.filter((project) => {
+      const path = project.worktreePath.replaceAll('\\', '/').toLowerCase();
+      return roots.some((root) => path === root || path.startsWith(`${root}/`));
+    }).map((project) => project.id));
+    if (!removed.size) {
+      return;
+    }
+    document.projects = document.projects.filter((project) => !removed.has(project.id));
+    document.connections = document.connections.filter((edge) =>
+      !removed.has(edge.from) && !removed.has(edge.to),
+    );
+    await this._save(document);
+  }
+
   remove(id: string) {
     return this.mutate(async () => {
       const state = await this.catalog();

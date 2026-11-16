@@ -29,3 +29,21 @@ export async function withGitIndex<T>(
   });
   return result;
 }
+
+/** Reserve all affected indices synchronously, so deletion cannot interleave with index writes. */
+export function withGitIndices<T>(paths: readonly string[], action: () => Promise<T>) {
+  const keys = [...new Set(paths)];
+  const result = Promise.all(keys.map((key) => writes.get(key) ?? Promise.resolve())).then(action);
+  const settled = result.then(() => undefined, () => undefined);
+  for (const key of keys) {
+    writes.set(key, settled);
+  }
+  void settled.then(() => {
+    for (const key of keys) {
+      if (writes.get(key) === settled) {
+        writes.delete(key);
+      }
+    }
+  });
+  return result;
+}

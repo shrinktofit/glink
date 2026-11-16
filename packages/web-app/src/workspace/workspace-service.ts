@@ -1,3 +1,10 @@
+import {
+  worktreeDeletionPath,
+  type WorktreeDeletionPlan,
+  type WorktreeDeletionResult,
+  type WorktreePreflightEvent,
+  type WorktreePreflightProgress,
+} from '@glink/protocol/git';
 import type { FileDiffResponse, GitIndexAction } from '@glink/protocol/git';
 import {
   glinkStatePath,
@@ -23,6 +30,64 @@ export class WorkspaceService {
 
   catalog(signal?: AbortSignal) {
     return WorkspaceService.catalog(signal);
+  }
+
+  async planWorktreeDeletion(
+    worktreePath: string, onProgress: (progress: WorktreePreflightProgress) => void,
+    signal: AbortSignal,
+  ): Promise<WorktreeDeletionPlan> {
+    const response = await fetch(`${worktreeDeletionPath}/preflight`, {
+      method: 'POST',
+      signal,
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ worktreePath }),
+    });
+    if (!response.ok) {
+      throw new Error((await response.json() as { error: string }).error);
+    }
+    const reader = response.body!.getReader();
+    const decoder = new TextDecoder();
+    let buffer = '';
+    let plan: WorktreeDeletionPlan | undefined;
+    try {
+      while (true) {
+        const { value, done } = await reader.read();
+        buffer += decoder.decode(value, { stream: !done });
+        let newline: number;
+        while ((newline = buffer.indexOf('\n')) >= 0) {
+          const event = JSON.parse(buffer.slice(0, newline)) as WorktreePreflightEvent;
+          buffer = buffer.slice(newline + 1);
+          if ('progress' in event) {
+            onProgress(event.progress);
+          } else if ('plan' in event) {
+            plan = event.plan;
+          } else {
+            throw new Error(event.error);
+          }
+        }
+        if (done) {
+          break;
+        }
+      }
+    } finally {
+      reader.releaseLock();
+    }
+    if (!plan || buffer.trim()) {
+      throw new Error('预检连接提前结束，请重新检查。');
+    }
+    return plan;
+  }
+
+  deleteWorktree(token: string) {
+    return WorkspaceService._request<WorktreeDeletionResult>(
+      `${worktreeDeletionPath}/execute`, 'POST', { token },
+    );
+  }
+
+  retryDeletionRecordCleanup(token: string) {
+    return WorkspaceService._request<Pick<WorktreeDeletionResult, 'recordErrors'>>(
+      `${worktreeDeletionPath}/cleanup`, 'POST', { token },
+    );
   }
 
   get(id: string, signal?: AbortSignal) {
