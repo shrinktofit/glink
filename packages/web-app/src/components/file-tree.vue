@@ -1,6 +1,12 @@
 <script setup lang="ts" generic="T extends FileTreeEntry">
-import { computed } from 'vue';
-import { fileTreePathsOverlap, type FileTreeEntry } from './file-tree';
+import { computed, nextTick, useTemplateRef, watch } from 'vue';
+import {
+  buildFileTree,
+  fileTreePathsOverlap,
+  sortedFileTreeNodes,
+  type FileTreeEntry,
+  type FileTreeNode,
+} from './file-tree';
 import TreeDisclosure from './tree-disclosure.vue';
 import { useExpansionState } from '../ui-state/use-expansion-state';
 
@@ -11,12 +17,14 @@ const props = withDefaults(defineProps<{
   disabledPaths?: readonly string[];
   stateKey?: string;
   dataReady?: boolean;
+  revealSelection?: boolean;
 }>(), {
   compactFolders: true,
   defaultExpanded: true,
   disabledPaths: () => [],
   stateKey: undefined,
   dataReady: true,
+  revealSelection: false,
 });
 const selected = defineModel<string>();
 const emit = defineEmits<{
@@ -27,38 +35,15 @@ const emit = defineEmits<{
   directoryContextmenu: [event: MouseEvent, path: string];
 }>();
 const disabled = computed(() => new Set(props.disabledPaths));
+const tree = useTemplateRef<HTMLElement>('tree');
 
 function isDisabled(path: string) {
   return disabled.value.has(path)
     || props.disabledPaths.some((pending) => fileTreePathsOverlap(path, pending));
 }
 
-interface TreeNode {
-  path: string;
-  name: string;
-  children: Map<string, TreeNode>;
-  item?: T;
-}
-
-const root = computed(() => {
-  const root = new Map<string, TreeNode>();
-  for (const item of props.items) {
-    let children = root;
-    const segments = item.path.split('/');
-    segments.forEach((name, index) => {
-      let node = children.get(name);
-      if (!node) {
-        node = { path: segments.slice(0, index + 1).join('/'), name, children: new Map() };
-        children.set(name, node);
-      }
-      if (index === segments.length - 1) {
-        node.item = item;
-      }
-      children = node.children;
-    });
-  }
-  return root;
-});
+type TreeNode = FileTreeNode<T>;
+const root = computed(() => buildFileTree(props.items));
 
 const folderPaths = computed(() => {
   const paths: string[] = [];
@@ -82,6 +67,21 @@ const { isExpanded, setExpanded } = useExpansionState(
   () => props.defaultExpanded,
 );
 
+watch([() => selected.value, () => props.revealSelection], async ([path, reveal]) => {
+  if (!path || !reveal) {
+    return;
+  }
+  const segments = path.split('/');
+  const ancestors = segments.slice(0, -1)
+    .map((_segment, index) => segments.slice(0, index + 1).join('/'));
+  if (ancestors.some((ancestor) => !isExpanded(ancestor))) {
+    setExpanded(ancestors, true);
+  }
+  await nextTick();
+  tree.value?.querySelector<HTMLElement>('[aria-selected="true"]')
+    ?.scrollIntoView({ block: 'nearest', inline: 'nearest' });
+}, { immediate: true, flush: 'post' });
+
 const rows = computed(() => {
   const result: Array<{
     node: TreeNode;
@@ -92,10 +92,7 @@ const rows = computed(() => {
   }> = [];
 
   function append(children: Map<string, TreeNode>, depth: number) {
-    const nodes = [...children.values()].sort((a, b) => {
-      return Number(!a.children.size) - Number(!b.children.size) || a.name.localeCompare(b.name);
-    });
-    for (const start of nodes) {
+    for (const start of sortedFileTreeNodes(children)) {
       let node = start;
       let name = node.name;
       const paths = [node.path];
@@ -219,6 +216,7 @@ function navigate(event: KeyboardEvent, index: number) {
 
 <template>
   <div
+    ref="tree"
     class="file-tree"
     role="tree"
   >

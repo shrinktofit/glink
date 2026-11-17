@@ -6,7 +6,8 @@
   "scripts": {
     "build": "vue-tsc --noEmit && vite build",
     "dev": "vite",
-    "typecheck": "vue-tsc --noEmit"
+    "typecheck": "vue-tsc --noEmit && tsc --project test/tsconfig.json",
+    "test": "vitest run"
   },
   "dependencies": {
     "@glink/protocol": "workspace:*",
@@ -20,11 +21,13 @@
   },
   "devDependencies": {
     "@glink/workflow": "workspace:*",
+    "@types/node": "catalog:",
     "@vitejs/plugin-vue": "catalog:",
     "less": "catalog:",
     "typescript": "catalog:",
     "vite": "catalog:",
     "vite-plugin-vuetify": "catalog:",
+    "vitest": "catalog:",
     "vue-tsc": "catalog:"
   }
 }

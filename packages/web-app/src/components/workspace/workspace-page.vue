@@ -20,6 +20,8 @@ import type {
 import { WorkspaceConnectionKind } from '@glink/protocol/workspace';
 import { appKey } from '../../app-context';
 import { GitIndexScope, type GitIndexTarget } from '../../git/git-index-target';
+import { nextChangeAfterIndex, orderGitChanges } from '../../git/git-index-selection';
+import { workspaceChangeGroups } from '../../workspace/workspace-change-groups';
 import GitFileDiff from '../git/git-file-diff.vue';
 import SplitPane from '../split-pane.vue';
 import WorkspaceOutline from './workspace-outline.vue';
@@ -365,10 +367,24 @@ function selectFile(projectId: string, file: GitFileChange, staged: boolean) {
   selection.value = { projectId, path: file.path, staged };
 }
 
+function orderedChanges(staged: boolean) {
+  const groups = workspaceChangeGroups(
+    workspace.value.projects, statuses.value, selectedProjectIds.value, staged,
+  );
+  return orderGitChanges(groups.map((group) => ({
+    worktreePath: group.project.worktreePath,
+    files: group.files,
+  })));
+}
+
 async function index(projectId: string, staged: boolean, target: GitIndexTarget) {
   if (busy.value || loading.value) {
     return;
   }
+  const before = orderedChanges(staged);
+  const selectionBefore = selection.value;
+  const scopeBefore = selectedProjectIds.value;
+  const project = workspace.value.projects.find((item) => item.id === projectId)!;
   busy.value = true;
   relatedStatusController?.abort();
   pendingIndex.value = {
@@ -398,6 +414,8 @@ async function index(projectId: string, staged: boolean, target: GitIndexTarget)
       const baseAmendBlockedReason = metadataStale
         ? '等待有效的项目状态。'
         : previous.baseAmendBlockedReason;
+      const advance = selection.value === selectionBefore
+        && selectedProjectIds.value === scopeBefore;
       applyStatuses([{
         ...state,
         headMessage: metadataStale ? undefined : previous.headMessage,
@@ -406,6 +424,19 @@ async function index(projectId: string, staged: boolean, target: GitIndexTarget)
         amendBlockedReason: baseAmendBlockedReason ?? state.amendBlockedReason,
         submodulePaths: state.submodulePaths ?? previous?.submodulePaths,
       }], false);
+      if (advance) {
+        const next = nextChangeAfterIndex(before, orderedChanges(staged), {
+          ...target,
+          worktreePath: project.worktreePath,
+          action,
+        });
+        const nextProject = next && workspace.value.projects.find(
+          (item) => item.worktreePath === next.worktreePath,
+        )!;
+        selection.value = next && nextProject
+          ? { projectId: nextProject.id, path: next.file.path, staged }
+          : undefined;
+      }
       if (previous?.head !== state.head) {
         historyRefreshKey.value++;
       }

@@ -8,6 +8,7 @@ import { useExpansionState } from '../../ui-state/use-expansion-state';
 import { useExpansionStateStore } from '../../ui-state/expansion-state-store';
 import { gitChangesTreeStateKey } from '../../git/git-changes-tree-state-key';
 import { GitIndexScope, type GitIndexTarget } from '../../git/git-index-target';
+import { workspaceChangeGroups } from '../../workspace/workspace-change-groups';
 const props = defineProps<{
   workspace: WorkspaceDocument;
   projectIds: readonly string[];
@@ -19,24 +20,13 @@ const props = defineProps<{
   loading: boolean;
 }>();
 const grouped = computed(() => props.projectIds.length > 1);
-const visibleProjects = computed(() => new Set(props.projectIds));
 const emit = defineEmits<{
   select: [projectId: string, file: GitFileChange];
   index: [projectId: string, target: GitIndexTarget];
 }>();
-const groups = computed(() =>
-  props.workspace.projects
-    .filter((project) => visibleProjects.value.has(project.id))
-    .map((project) => {
-      const status = props.statuses.find((item) => item.projectId === project.id);
-      return {
-        project,
-        error: status?.error,
-        files: (props.staged ? status?.staged : status?.unstaged) ?? [],
-      };
-    })
-    .filter((group) => group.files.length || (!props.staged && group.error)),
-);
+const groups = computed(() => workspaceChangeGroups(
+  props.workspace.projects, props.statuses, props.projectIds, props.staged,
+));
 const count = computed(() => groups.value.reduce((sum, group) => sum + group.files.length, 0));
 
 function changeIndex(projectId: string, file: GitFileChange) {
@@ -94,6 +84,11 @@ const { isExpanded, setExpanded } = useExpansionState(
   () => props.workspace.projects.map((project) => project.id),
   true,
 );
+watch(() => props.selected, (selected) => {
+  if (grouped.value && selected?.staged === props.staged) {
+    setExpanded([selected.projectId], true);
+  }
+});
 const cache = useExpansionStateStore();
 watch(() => [props.statuses, props.workspace.projects], () => {
   // Empty successful lists have no mounted tree to capture a new snapshot.
@@ -156,6 +151,7 @@ function toggleProject(id: string) {
             :repo-path="group.project.worktreePath"
             :state-key="gitChangesTreeStateKey(group.project.worktreePath, staged)"
             :data-ready="!group.error"
+            reveal-selection
             :index-action="staged ? GitIndexAction.unstage : GitIndexAction.stage"
             :index-disabled="busy || loading"
             :disabled-paths="

@@ -13,6 +13,7 @@ const props = withDefaults(defineProps<{
   disabledPaths?: readonly string[];
   stateKey?: string;
   dataReady?: boolean;
+  revealSelection?: boolean;
   indexAction?: GitIndexAction;
   indexDisabled?: boolean;
 }>(), {
@@ -20,6 +21,7 @@ const props = withDefaults(defineProps<{
   disabledPaths: () => [],
   stateKey: undefined,
   dataReady: true,
+  revealSelection: false,
   indexAction: undefined,
   indexDisabled: false,
 });
@@ -92,6 +94,7 @@ const markers: Record<GitDiffType, { icon: string; label: string; color: string 
     :disabled-paths="disabledPaths"
     :state-key="stateKey"
     :data-ready="dataReady"
+    :reveal-selection="revealSelection"
     @select="emit('select', $event)"
     @activate="emit('activate', $event)"
     @activate-directory="indexDirectory"

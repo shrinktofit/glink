@@ -44,6 +44,7 @@ function changeIndex(file: GitFileChange) {
         :repo-path="repo.repoPath"
         :state-key="gitChangesTreeStateKey(repo.repoPath, staged)"
         :data-ready="ready"
+        reveal-selection
         :model-value="selectedPath"
         :disabled-paths="pendingPath ? [pendingPath] : undefined"
         :index-action="action"

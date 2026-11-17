@@ -1,15 +1,16 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, provide, ref, watch, onWatcherCleanup } from 'vue';
+import { GitIndexAction } from '@glink/protocol/git';
 import type {
   FileDiffResponse,
   GitCommitInput,
   GitFileChange,
-  GitIndexAction,
   RepositoryOverview,
   WorktreeStatus,
 } from '@glink/protocol/git';
 import { GitRepoService, gitRepoServiceKey } from '../../git/git-repo-service';
 import { GitIndexScope, type GitIndexTarget } from '../../git/git-index-target';
+import { nextChangeAfterIndex, orderGitChanges } from '../../git/git-index-selection';
 import SplitPane from '../split-pane.vue';
 import GitHistoryView from './git-history-view.vue';
 import GitLocalChangesView from './git-local-changes-view.vue';
@@ -129,6 +130,12 @@ async function changeIndex(target: GitIndexTarget, action: GitIndexAction) {
   if (busy.value || loading.value) {
     return;
   }
+  const staged = action === GitIndexAction.unstage;
+  const selectionBefore = selectedFile.value;
+  const before = orderGitChanges([{
+    worktreePath: repo.repoPath,
+    files: staged ? status.value.staged : status.value.unstaged,
+  }]);
   busy.value = true;
   metadataController?.abort();
   pendingIndexPath.value = target.scope === GitIndexScope.worktree ? undefined : target.path;
@@ -145,7 +152,20 @@ async function changeIndex(target: GitIndexTarget, action: GitIndexAction) {
     metadataDirty ||= headChanged;
     overviewDirty ||= headChanged || !!state.submodulePaths
       || status.value.branch !== state.branch;
+    const advance = selectedFile.value === selectionBefore;
     applyStatus({ ...state, headMessage: headChanged ? undefined : status.value.headMessage });
+    if (advance) {
+      const after = orderGitChanges([{
+        worktreePath: repo.repoPath,
+        files: staged ? state.staged : state.unstaged,
+      }]);
+      const next = nextChangeAfterIndex(before, after, {
+        ...target,
+        worktreePath: repo.repoPath,
+        action,
+      });
+      selectedFile.value = next ? { file: next.file, staged } : undefined;
+    }
     if (headChanged) {
       historyRefreshKey.value++;
     }
