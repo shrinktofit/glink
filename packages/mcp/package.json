@@ -1,0 +1,30 @@
+{
+  "name": "@glink/mcp",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "vite build && tsc -b --force",
+    "start": "node lib/main.js",
+    "test": "node --run build && vitest run",
+    "typecheck": "tsc --noEmit && tsc --project test/tsconfig.json"
+  },
+  "dependencies": {
+    "@glink/protocol": "workspace:*",
+    "@modelcontextprotocol/server": "2.4.0"
+  },
+  "devDependencies": {
+    "@glink/workflow": "workspace:*",
+    "@modelcontextprotocol/client": "2.4.0",
+    "@types/node": "catalog:",
+    "typescript": "catalog:",
+    "vite": "catalog:",
+    "vitest": "catalog:"
+  },
+  "bin": {
+    "glink-mcp": "./lib/main.js"
+  },
+  "exports": {
+    "./server": "./lib/server.js"
+  }
+}

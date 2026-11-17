@@ -1,3 +1,5 @@
+import { toolsPath } from '@glink/protocol/tools';
+import { executeWorkspaceTool } from '../tools/workspace-tools.ts';
 import { WorktreeDeletionService } from './worktree-deletion-service.ts';
 import { WorktreeRemovalError } from '../git/worktree-removal.ts';
 import { worktreeDeletionPath, type WorktreePreflightEvent } from '@glink/protocol/git';
@@ -40,6 +42,41 @@ async function body<T>(request: IncomingMessage): Promise<T> {
 export async function createGlinkRequestHandler(options: { glinkHome: string }) {
   const store = await WorkspaceStore.open(options.glinkHome);
   const deletion = new WorktreeDeletionService(store);
+
+  function sendErrorResponse(response: ServerResponse, error: unknown) {
+    if (response.destroyed) {
+      return;
+    }
+
+    let status = 500;
+
+    if (error instanceof WorkspaceError || error instanceof WorktreeRemovalError) {
+      status = error.status;
+    } else if (error instanceof GitIndexLockedError || error instanceof GitSubmoduleDirtyError) {
+      status = 409;
+    }
+
+    const message = error instanceof Error ? error.message : String(error);
+
+    response
+      .writeHead(status, { 'Content-Type': 'application/json; charset=utf-8' })
+      .end(JSON.stringify({ error: message }));
+  }
+
+  async function toolRequest(request: IncomingMessage, response: ServerResponse, url: URL) {
+    if (request.method !== 'POST') {
+      response.writeHead(405, { Allow: 'POST' }).end();
+      return;
+    }
+
+    const name = decodeURIComponent(url.pathname.slice(toolsPath.length + 1));
+    const input = await body<unknown>(request);
+    const result = await executeWorkspaceTool(store, name, input);
+
+    response
+      .writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' })
+      .end(JSON.stringify(result));
+  }
 
   async function readRequestedProjects(id: string, url: URL) {
     const document = await store.get(id);
@@ -170,6 +207,13 @@ export async function createGlinkRequestHandler(options: { glinkHome: string }) 
 
   return (request: IncomingMessage, response: ServerResponse): void => {
     const url = new URL(request.url ?? '/', 'http://localhost');
+    if (url.pathname === toolsPath || url.pathname.startsWith(`${toolsPath}/`)) {
+      toolRequest(request, response, url).catch((error: unknown) => {
+        sendErrorResponse(response, error);
+      });
+
+      return;
+    }
     if (
       !url.pathname.startsWith(`${worktreeDeletionPath}/`)
       && url.pathname !== glinkStatePath
@@ -180,19 +224,7 @@ export async function createGlinkRequestHandler(options: { glinkHome: string }) 
       return;
     }
     workspaceRequest(request, response, url).catch((error: unknown) => {
-      if (response.destroyed) {
-        return;
-      }
-      const message = error instanceof Error ? error.message : String(error);
-      response
-        .writeHead(error instanceof WorkspaceError || error instanceof WorktreeRemovalError
-          ? error.status
-          : error instanceof GitIndexLockedError || error instanceof GitSubmoduleDirtyError
-            ? 409
-            : 500, {
-          'Content-Type': 'application/json; charset=utf-8',
-        })
-        .end(JSON.stringify({ error: message }));
+      sendErrorResponse(response, error);
     });
   };
 }

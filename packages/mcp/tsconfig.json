@@ -1,0 +1,17 @@
+{
+  "extends": "@glink/workflow/tsconfig/basic",
+  "include": [
+    "src"
+  ],
+  "compilerOptions": {
+    "rootDir": "src",
+    "outDir": "lib",
+    "composite": true,
+    "emitDeclarationOnly": true,
+    "declarationMap": true,
+    "allowImportingTsExtensions": true,
+    "types": [
+      "node"
+    ]
+  }
+}

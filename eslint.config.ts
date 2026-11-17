@@ -1,5 +1,3 @@
-// @ts-check
-
 import { defineConfig, globalIgnores } from 'eslint/config';
 import globals from 'globals';
 import stf from '@shrinktofit/eslint-config';
@@ -14,7 +12,13 @@ export default defineConfig([
     '**/.local/',
     '**/.turbo/',
   ]),
-  { settings: { node: { version: '>=26.0.0' } } },
+  {
+    settings: {
+      node: {
+        version: '>=26.0.0',
+      },
+    },
+  },
   ...stf.configs.recommended,
   ...stf.configs.conventions,
   ...vue.configs.recommended,
@@ -24,14 +28,15 @@ export default defineConfig([
       globals: globals.browser,
     },
   },
-  ...node.configs.recommended.map((config) => ({
-    ...config,
+  {
     files: [
-      'eslint.config.js',
+      'eslint.config.ts',
       'packages/*/*.config.ts',
       'packages/server/**/*.ts',
+      'packages/mcp/**/*.ts',
     ],
-  })),
+    extends: [node.configs.recommended],
+  },
   {
     languageOptions: {
       parserOptions: {

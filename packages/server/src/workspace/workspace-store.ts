@@ -10,6 +10,7 @@ import {
   type GlinkCatalog,
   type GlinkState,
   type UpdateProjectInput,
+  type PatchProjectInput,
   type WorkspaceDocument,
   type WorkspaceProject,
 } from '@glink/protocol/workspace';
@@ -267,68 +268,46 @@ export class WorkspaceStore {
     });
   }
 
-  updateProject(id: string, projectId: string, input: UpdateProjectInput) {
+  updateProject(
+    id: string,
+    projectId: string,
+    input: UpdateProjectInput,
+  ) {
+    return this.mutate(async () => {
+      const document = await this.get(id);
+
+      return this._applyProjectUpdate(document, projectId, input);
+    });
+  }
+
+  patchProject(
+    id: string,
+    projectId: string,
+    patch: PatchProjectInput,
+  ) {
     return this.mutate(async () => {
       const document = await this.get(id);
       const project = this.project(document, projectId);
-      if (
-        typeof input.name !== 'string'
-        || !input.name.trim()
-        || typeof input.settled !== 'boolean'
-        || !input.binding
-        || !Object.values(ProjectBindingKind).includes(input.binding.kind)
-        || typeof input.binding.revision !== 'string'
-        || !input.binding.revision.trim()
-        || !Array.isArray(input.dependencyIds)
-        || input.dependencyIds.some((value) => typeof value !== 'string')
-        || (input.baseCommit !== undefined && typeof input.baseCommit !== 'string')
-      ) {
-        throw new WorkspaceError('Invalid project configuration.');
-      }
-      const locked = document.connections.filter(
-        (edge) => edge.from === projectId && edge.kind === WorkspaceConnectionKind.submodule,
-      );
-      if (locked.some((edge) => !input.dependencyIds.includes(edge.to))) {
-        throw new WorkspaceError('Submodule connections cannot be disconnected.', 409);
-      }
-      let baseCommit = input.baseCommit?.trim() === '' ? undefined : input.baseCommit?.trim();
-      if (baseCommit && baseCommit !== project.baseCommit) {
-        baseCommit = await this._commitSha(project.worktreePath, baseCommit);
-      }
-      const binding = { ...input.binding, revision: input.binding.revision.trim() };
-      if (
-        binding.kind === ProjectBindingKind.commit
-        && !/^[a-f0-9]{4,64}$/i.test(binding.revision)
-      ) {
-        throw new WorkspaceError('请输入 4–64 位十六进制 commit hash。');
-      }
-      if (binding.kind !== project.binding.kind || binding.revision !== project.binding.revision) {
-        if (binding.kind === ProjectBindingKind.commit) {
-          binding.revision = await this._commitSha(project.worktreePath, binding.revision);
-        } else {
-          const branches = await readProjectBranches(project);
-          if (!branches.some((branch) => branch.revision === binding.revision)) {
-            throw new WorkspaceError('所选分支不存在，请重新选择。');
-          }
-        }
-      }
-      Object.assign(project, {
-        name: input.name.trim(),
-        settled: input.settled,
-        baseCommit,
-        binding,
+      const { manualDependencyIds, ...values } = patch;
+      const dependencies = document.connections.filter((edge) => edge.from === projectId);
+
+      const dependencyIds = manualDependencyIds === undefined
+        ? dependencies.map((edge) => edge.to)
+        : [
+          ...dependencies
+            .filter((edge) => edge.kind === WorkspaceConnectionKind.submodule)
+            .map((edge) => edge.to),
+          ...manualDependencyIds,
+        ];
+
+      return this._applyProjectUpdate(document, projectId, {
+        name: project.name,
+        settled: project.settled,
+        baseCommit: project.baseCommit,
+        binding: project.binding,
+        ...values,
+        dependencyIds,
       });
-      document.connections = document.connections
-        .filter((edge) => edge.from !== projectId)
-        .concat(
-          locked,
-          [...new Set(input.dependencyIds)]
-            .filter((to) => !locked.some((edge) => edge.to === to))
-            .map((to) => ({ from: projectId, to, kind: WorkspaceConnectionKind.manual })),
-        );
-      validateGraph(document);
-      await this._save(document);
-      return document;
     });
   }
 
@@ -406,6 +385,72 @@ export class WorkspaceStore {
   }
 
   private _writes: Promise<void> = Promise.resolve();
+
+  private async _applyProjectUpdate(
+    document: WorkspaceDocument,
+    projectId: string,
+    input: UpdateProjectInput,
+  ) {
+    const project = this.project(document, projectId);
+    if (
+      typeof input.name !== 'string'
+      || !input.name.trim()
+      || typeof input.settled !== 'boolean'
+      || !input.binding
+      || !Object.values(ProjectBindingKind).includes(input.binding.kind)
+      || typeof input.binding.revision !== 'string'
+      || !input.binding.revision.trim()
+      || !Array.isArray(input.dependencyIds)
+      || input.dependencyIds.some((value) => typeof value !== 'string')
+      || (input.baseCommit !== undefined && typeof input.baseCommit !== 'string')
+    ) {
+      throw new WorkspaceError('Invalid project configuration.');
+    }
+    const locked = document.connections.filter(
+      (edge) => edge.from === projectId && edge.kind === WorkspaceConnectionKind.submodule,
+    );
+    if (locked.some((edge) => !input.dependencyIds.includes(edge.to))) {
+      throw new WorkspaceError('Submodule connections cannot be disconnected.', 409);
+    }
+    let baseCommit = input.baseCommit?.trim() === '' ? undefined : input.baseCommit?.trim();
+    if (baseCommit && baseCommit !== project.baseCommit) {
+      baseCommit = await this._commitSha(project.worktreePath, baseCommit);
+    }
+    const binding = { ...input.binding, revision: input.binding.revision.trim() };
+    if (
+      binding.kind === ProjectBindingKind.commit
+      && !/^[a-f0-9]{4,64}$/i.test(binding.revision)
+    ) {
+      throw new WorkspaceError('请输入 4–64 位十六进制 commit hash。');
+    }
+    if (binding.kind !== project.binding.kind || binding.revision !== project.binding.revision) {
+      if (binding.kind === ProjectBindingKind.commit) {
+        binding.revision = await this._commitSha(project.worktreePath, binding.revision);
+      } else {
+        const branches = await readProjectBranches(project);
+        if (!branches.some((branch) => branch.revision === binding.revision)) {
+          throw new WorkspaceError('所选分支不存在，请重新选择。');
+        }
+      }
+    }
+    Object.assign(project, {
+      name: input.name.trim(),
+      settled: input.settled,
+      baseCommit,
+      binding,
+    });
+    document.connections = document.connections
+      .filter((edge) => edge.from !== projectId)
+      .concat(
+        locked,
+        [...new Set(input.dependencyIds)]
+          .filter((to) => !locked.some((edge) => edge.to === to))
+          .map((to) => ({ from: projectId, to, kind: WorkspaceConnectionKind.manual })),
+      );
+    validateGraph(document);
+    await this._save(document);
+    return document;
+  }
 
   private async _commitSha(path: string, revision: string) {
     try {

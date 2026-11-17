@@ -20,6 +20,7 @@
     "@types/node": "catalog:",
     "eslint": "^10.9.0",
     "globals": "^17.14.0",
+    "jiti": "^2.7.0",
     "turbo": "^2.9.12",
     "typescript": "catalog:"
   }

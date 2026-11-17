@@ -8,6 +8,7 @@ export default defineConfig({
         health: 'src/health.ts',
         git: 'src/git.ts',
         workspace: 'src/workspace.ts',
+        tools: 'src/tools.ts',
       },
       formats: ['es'],
       fileName: (_format, entryName) => `${entryName}.js`,
@@ -15,5 +16,8 @@ export default defineConfig({
     minify: false,
     outDir: 'lib',
     sourcemap: true,
+    rollupOptions: {
+      external: ['zod'],
+    },
   },
 });

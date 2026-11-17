@@ -71,6 +71,15 @@ export interface UpdateProjectInput {
   dependencyIds: string[];
 }
 
+/** Workspace-only metadata edits; association changes do not checkout the worktree. */
+export interface PatchProjectInput {
+  name?: string;
+  settled?: boolean;
+  baseCommit?: string;
+  binding?: WorkspaceProject['binding'];
+  manualDependencyIds?: string[];
+}
+
 export interface WorkspaceProjectStatus extends WorktreeStatus {
   projectId: string;
   baseCommit?: string;

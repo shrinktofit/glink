@@ -9,5 +9,6 @@ Glink 是一个基于 Web 的本地 Git 工作台，把一起开发的多个仓�
 - **修改与提交**：按项目汇总 staged / unstaged 文件，查看双栏 Diff，逐文件暂存，按依赖顺序提交选定项目。
 - **聚焦历史**：查看各项目从 base commit 到 HEAD 的提交及文件变化。
 - **仓库浏览**：浏览提交图、worktree、分支、远端、标签、stash 和 submodule，支持 Commit 与 Amend。
+- **Agent 协作**：通过独立 MCP 进程管理工作区、项目依赖与完成状态，支持手动启动后端后继续调用。
 
 工作区配置保存在本地 YAML 文件中。

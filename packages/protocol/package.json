@@ -6,11 +6,15 @@
   "exports": {
     "./health": "./lib/health.js",
     "./git": "./lib/git.js",
-    "./workspace": "./lib/workspace.js"
+    "./workspace": "./lib/workspace.js",
+    "./tools": "./lib/tools.js"
   },
   "scripts": {
     "build": "vite build && tsc -b --force",
     "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "zod": "4.4.0"
   },
   "devDependencies": {
     "@glink/workflow": "workspace:*",

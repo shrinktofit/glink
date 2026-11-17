@@ -1,14 +1,12 @@
 {
   "extends": "@glink/workflow/tsconfig/basic",
   "include": [
-    "eslint.config.js",
+    "eslint.config.ts",
     "packages/*/vite.config.ts",
     "packages/*/vitest.config.ts"
   ],
   "compilerOptions": {
     "rootDir": ".",
-    "allowJs": true,
-    "checkJs": true,
     "noEmit": true,
     "types": [
       "node"
