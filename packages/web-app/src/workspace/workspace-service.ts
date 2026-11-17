@@ -5,7 +5,7 @@ import {
   type WorktreePreflightEvent,
   type WorktreePreflightProgress,
 } from '@glink/protocol/git';
-import type { FileDiffResponse, GitIndexAction } from '@glink/protocol/git';
+import type { FileDiffResponse, GitIndexAction, GitReferenceOption } from '@glink/protocol/git';
 import {
   glinkStatePath,
   workspacesPath,
@@ -18,7 +18,8 @@ import {
   type WorkspaceDocument,
   type WorkspaceProjectStatus,
   type WorkspaceChangesSnapshot,
-  type WorkspaceBranch,
+  type BaselineRefComparison,
+  type ProjectBaseline,
 } from '@glink/protocol/workspace';
 
 export class WorkspaceService {
@@ -115,12 +116,28 @@ export class WorkspaceService {
     );
   }
 
-  branches(id: string, projectId: string, signal?: AbortSignal) {
-    return this._request<WorkspaceBranch[]>(id,
-      `/projects/${encodeURIComponent(projectId)}/branches`,
+  references(id: string, projectId: string, signal?: AbortSignal) {
+    return this._request<GitReferenceOption[]>(id,
+      `/projects/${encodeURIComponent(projectId)}/references`,
       'GET',
       undefined,
       signal);
+  }
+
+  compareBaseline(
+    id: string,
+    projectId: string,
+    baseline: ProjectBaseline & { ref: string },
+    signal?: AbortSignal,
+  ) {
+    const query = new URLSearchParams({ commit: baseline.commit, ref: baseline.ref });
+    return this._request<BaselineRefComparison>(
+      id,
+      `/projects/${encodeURIComponent(projectId)}/baseline-comparison?${query}`,
+      'GET',
+      undefined,
+      signal,
+    );
   }
 
   removeProject(id: string, projectId: string) {

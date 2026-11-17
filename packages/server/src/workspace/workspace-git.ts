@@ -1,14 +1,14 @@
 import { lstat, realpath } from 'node:fs/promises';
 import { join } from 'node:path';
-import type { GitCommit } from '@glink/protocol/git';
+import { GitRevisionKind, type GitCommit } from '@glink/protocol/git';
 import type {
-  WorkspaceBranch,
   WorkspaceProject,
   WorkspaceProjectStatus,
 } from '@glink/protocol/workspace';
 import { readWorktreeStatus } from '../git/worktree.ts';
 import { runGit } from '../git/run-git.ts';
 import { readSubmodulePaths } from '../git/read-changes.ts';
+import { readReferenceCommit } from './project-references.ts';
 
 export async function hasWorktree(path: string) {
   try {
@@ -78,30 +78,43 @@ export async function readProjectStatus(
   ]);
   let baseAmendBlockedReason: string | undefined;
   let aheadCount: number | undefined;
-  if (!status.head || !project.baseCommit) {
-    baseAmendBlockedReason = '需要有效的 HEAD 和基础提交才能修订。';
-  } else if (status.head === project.baseCommit) {
+  const baselineCommit = project.baseline?.commit;
+  if (!status.head || !baselineCommit) {
+    baseAmendBlockedReason = '需要有效的 HEAD 和基线才能修订。';
+  } else if (status.head === baselineCommit) {
     aheadCount = 0;
-    baseAmendBlockedReason = 'HEAD 必须位于基础提交之后才能修订。';
+    baseAmendBlockedReason = 'HEAD 必须位于基线之后才能修订。';
   } else {
     const counts = await runGit(project.worktreePath, [
       'rev-list',
       '--left-right',
       '--count',
-      `${project.baseCommit}...${status.head}`,
+      `${baselineCommit}...${status.head}`,
     ], { signal });
     const [behind, ahead] = counts.trim().split(/\s+/).map(Number);
     aheadCount = ahead;
     if (behind > 0 || ahead === 0) {
-      baseAmendBlockedReason = 'HEAD 必须位于基础提交之后才能修订。';
+      baseAmendBlockedReason = 'HEAD 必须位于基线之后才能修订。';
     }
+  }
+  let bindingMismatch: boolean;
+  if (project.binding.kind === GitRevisionKind.commit) {
+    bindingMismatch = project.binding.revision !== status.head;
+  } else if (project.binding.revision.startsWith('refs/heads/')) {
+    bindingMismatch = project.binding.revision !== `refs/heads/${status.branch ?? ''}`;
+  } else {
+    const boundCommit = await readReferenceCommit(
+      project.worktreePath, project.binding.revision, signal,
+    );
+    bindingMismatch = !boundCommit || boundCommit !== status.head;
   }
   return {
     ...status,
     projectId: project.id,
-    baseCommit: project.baseCommit,
+    baselineCommit,
     aheadCount,
     baseAmendBlockedReason,
+    bindingMismatch,
     amendBlockedReason: baseAmendBlockedReason ?? status.amendBlockedReason,
     submodulePaths,
   };
@@ -118,7 +131,7 @@ export async function readProjectCommits(
     '--no-show-signature',
     '--format=%H%x00%P%x00%s%x00%an%x00%aI',
     '-z',
-    project.baseCommit ? `${project.baseCommit}..HEAD` : 'HEAD',
+    project.baseline ? `${project.baseline.commit}..HEAD` : 'HEAD',
   ], { signal });
   const fields = output.split('\0');
   const commits: GitCommit[] = [];
@@ -132,33 +145,4 @@ export async function readProjectCommits(
     });
   }
   return commits;
-}
-
-export async function readProjectBranches(project: WorkspaceProject): Promise<WorkspaceBranch[]> {
-  if (!await hasWorktree(project.worktreePath)) {
-    throw new Error('Worktree is unavailable or not initialized.');
-  }
-  const output = await runGit(project.worktreePath, [
-    'for-each-ref',
-    '--format=%(refname)%00%(objectname)%00%(HEAD)%00%(symref)',
-    'refs/heads',
-    'refs/remotes',
-  ]);
-  return output.split('\n').filter(Boolean).flatMap((line) => {
-    const [
-      ref,
-      sha,
-      current,
-      symbolic,
-    ] = line.split('\0');
-    if (symbolic) {
-      return [];
-    }
-    return [{
-      name: ref.slice(ref.startsWith('refs/heads/') ? 11 : 13),
-      revision: ref.startsWith('refs/heads/') ? ref.slice(11) : ref,
-      sha,
-      current: current === '*',
-    }];
-  });
 }

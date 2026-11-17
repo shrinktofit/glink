@@ -1,10 +1,9 @@
-import { runGit } from '../git/run-git.ts';
+import { GitRevisionKind } from '@glink/protocol/git';
 import { randomUUID } from 'node:crypto';
 import { mkdir, readFile, rename, unlink, writeFile } from 'node:fs/promises';
 import { basename, join } from 'node:path';
 import { parse, stringify } from 'yaml';
 import {
-  ProjectBindingKind,
   WorkspaceConnectionKind,
   type CreateWorkspaceInput,
   type GlinkCatalog,
@@ -13,20 +12,20 @@ import {
   type PatchProjectInput,
   type WorkspaceDocument,
   type WorkspaceProject,
+  type ProjectBaseline,
 } from '@glink/protocol/workspace';
 import {
   hasWorktree,
   inspectWorktree,
-  readProjectBranches,
 } from './workspace-git.ts';
+import { checkReferenceName, readCommitSha, readReferenceCommit } from './project-references.ts';
+import { WorkspaceError } from './workspace-error.ts';
 
-export class WorkspaceError extends Error {
-  constructor(message: string, status = 400) {
-    super(message);
-    this.status = status;
-  }
-
-  readonly status: number;
+function isBaseline(value: unknown): value is ProjectBaseline {
+  const baseline = value as ProjectBaseline | undefined;
+  return !!baseline && typeof baseline.commit === 'string'
+    && /^[a-f0-9]{4,64}$/i.test(baseline.commit)
+    && (baseline.ref === undefined || typeof baseline.ref === 'string');
 }
 
 function validateGraph(document: WorkspaceDocument) {
@@ -67,7 +66,7 @@ function validateGraph(document: WorkspaceDocument) {
 function validateDocument(value: unknown): asserts value is WorkspaceDocument {
   const doc = value as WorkspaceDocument | undefined;
   if (
-    doc?.version !== 1
+    doc?.version !== 2
     || typeof doc.id !== 'string'
     || typeof doc.name !== 'string'
     || !Array.isArray(doc.projects)
@@ -82,9 +81,9 @@ function validateDocument(value: unknown): asserts value is WorkspaceDocument {
       || typeof project.name !== 'string'
       || typeof project.worktreePath !== 'string'
       || typeof project.settled !== 'boolean'
-      || (project.baseCommit !== undefined && typeof project.baseCommit !== 'string')
+      || (project.baseline !== undefined && !isBaseline(project.baseline))
       || !project.binding
-      || !Object.values(ProjectBindingKind).includes(project.binding.kind)
+      || !Object.values(GitRevisionKind).includes(project.binding.kind)
       || typeof project.binding.revision !== 'string'
     ) {
       throw new WorkspaceError('Invalid project in workspace YAML document.');
@@ -172,7 +171,7 @@ export class WorkspaceStore {
       }
       const now = new Date().toISOString();
       const document: WorkspaceDocument = {
-        version: 1,
+        version: 2,
         id: randomUUID(),
         name: input.name.trim(),
         createdAt: now,
@@ -288,7 +287,7 @@ export class WorkspaceStore {
     return this.mutate(async () => {
       const document = await this.get(id);
       const project = this.project(document, projectId);
-      const { manualDependencyIds, ...values } = patch;
+      const { manualDependencyIds, baseline, ...values } = patch;
       const dependencies = document.connections.filter((edge) => edge.from === projectId);
 
       const dependencyIds = manualDependencyIds === undefined
@@ -303,7 +302,7 @@ export class WorkspaceStore {
       return this._applyProjectUpdate(document, projectId, {
         name: project.name,
         settled: project.settled,
-        baseCommit: project.baseCommit,
+        baseline: baseline === null ? undefined : baseline ?? project.baseline,
         binding: project.binding,
         ...values,
         dependencyIds,
@@ -397,12 +396,12 @@ export class WorkspaceStore {
       || !input.name.trim()
       || typeof input.settled !== 'boolean'
       || !input.binding
-      || !Object.values(ProjectBindingKind).includes(input.binding.kind)
+      || !Object.values(GitRevisionKind).includes(input.binding.kind)
       || typeof input.binding.revision !== 'string'
       || !input.binding.revision.trim()
       || !Array.isArray(input.dependencyIds)
       || input.dependencyIds.some((value) => typeof value !== 'string')
-      || (input.baseCommit !== undefined && typeof input.baseCommit !== 'string')
+      || (input.baseline !== undefined && !isBaseline(input.baseline))
     ) {
       throw new WorkspaceError('Invalid project configuration.');
     }
@@ -412,31 +411,37 @@ export class WorkspaceStore {
     if (locked.some((edge) => !input.dependencyIds.includes(edge.to))) {
       throw new WorkspaceError('Submodule connections cannot be disconnected.', 409);
     }
-    let baseCommit = input.baseCommit?.trim() === '' ? undefined : input.baseCommit?.trim();
-    if (baseCommit && baseCommit !== project.baseCommit) {
-      baseCommit = await this._commitSha(project.worktreePath, baseCommit);
+    const baseline = input.baseline && { ...input.baseline };
+    if (baseline && baseline.commit !== project.baseline?.commit) {
+      baseline.commit = await readCommitSha(project.worktreePath, baseline.commit);
+    }
+    if (baseline?.ref !== undefined && baseline.ref !== project.baseline?.ref) {
+      await checkReferenceName(project.worktreePath, baseline.ref);
     }
     const binding = { ...input.binding, revision: input.binding.revision.trim() };
     if (
-      binding.kind === ProjectBindingKind.commit
+      binding.kind === GitRevisionKind.commit
       && !/^[a-f0-9]{4,64}$/i.test(binding.revision)
     ) {
       throw new WorkspaceError('请输入 4–64 位十六进制 commit hash。');
     }
     if (binding.kind !== project.binding.kind || binding.revision !== project.binding.revision) {
-      if (binding.kind === ProjectBindingKind.commit) {
-        binding.revision = await this._commitSha(project.worktreePath, binding.revision);
+      if (binding.kind === GitRevisionKind.commit) {
+        binding.revision = await readCommitSha(project.worktreePath, binding.revision);
       } else {
-        const branches = await readProjectBranches(project);
-        if (!branches.some((branch) => branch.revision === binding.revision)) {
-          throw new WorkspaceError('所选分支不存在，请重新选择。');
+        const tag = binding.kind === GitRevisionKind.tag;
+        if (tag !== binding.revision.startsWith('refs/tags/')) {
+          throw new WorkspaceError('引用类型与选择的分支或标签不一致。');
+        }
+        if (!await readReferenceCommit(project.worktreePath, binding.revision)) {
+          throw new WorkspaceError('所选引用不存在，请重新选择。');
         }
       }
     }
     Object.assign(project, {
       name: input.name.trim(),
       settled: input.settled,
-      baseCommit,
+      baseline,
       binding,
     });
     document.connections = document.connections
@@ -450,25 +455,6 @@ export class WorkspaceStore {
     validateGraph(document);
     await this._save(document);
     return document;
-  }
-
-  private async _commitSha(path: string, revision: string) {
-    try {
-      return (
-        await runGit(path, [
-          'rev-parse',
-          '--quiet',
-          '--verify',
-          '--end-of-options',
-          `${revision}^{commit}`,
-        ])
-      ).trim();
-    } catch (error: unknown) {
-      if ((error as { code?: number }).code === 1) {
-        throw new WorkspaceError('提交不存在或短 hash 不唯一，请检查后重试。');
-      }
-      throw error;
-    }
   }
 
   private _projectByPath(document: WorkspaceDocument, path: string) {
@@ -505,11 +491,16 @@ export class WorkspaceStore {
       id: randomUUID(),
       name: basename(canonical),
       worktreePath: canonical,
-      baseCommit: head,
+      baseline: head
+        ? {
+          commit: head,
+          ref: info?.branch ? `refs/heads/${info.branch}` : undefined,
+        }
+        : undefined,
       settled: false,
       binding: info?.branch
-        ? { kind: ProjectBindingKind.branch, revision: info.branch }
-        : { kind: ProjectBindingKind.commit, revision: head ?? '' },
+        ? { kind: GitRevisionKind.branch, revision: `refs/heads/${info.branch}` }
+        : { kind: GitRevisionKind.commit, revision: head ?? '' },
     };
     document.projects.push(project);
     for (const submodule of info?.submodules ?? []) {

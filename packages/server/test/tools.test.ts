@@ -209,12 +209,12 @@ describe('Glink workspace tool API against temporary Git repositories', () => {
       changes: {
         binding: {
           kind: 'branch',
-          revision: 'alternate',
+          revision: 'refs/heads/alternate',
         },
       },
     });
 
-    expect(workspace.projects[0].binding.revision).toBe('alternate');
+    expect(workspace.projects[0].binding.revision).toBe('refs/heads/alternate');
     expect(await git(first, 'branch', '--show-current')).toBe('main');
 
     const sha = await git(first, 'rev-parse', 'HEAD');
@@ -222,7 +222,7 @@ describe('Glink workspace tool API against temporary Git repositories', () => {
       workspaceId: workspace.id,
       projectId: id,
       changes: {
-        baseCommit: 'main',
+        baseline: { commit: sha, ref: 'refs/heads/main' },
         binding: {
           kind: 'commit',
           revision: sha.slice(0, 8),
@@ -233,7 +233,7 @@ describe('Glink workspace tool API against temporary Git repositories', () => {
     expect(workspace.projects[0]).toMatchObject({
       name: 'Renamed',
       settled: true,
-      baseCommit: sha,
+      baseline: { commit: sha, ref: 'refs/heads/main' },
       binding: {
         kind: 'commit',
         revision: sha,

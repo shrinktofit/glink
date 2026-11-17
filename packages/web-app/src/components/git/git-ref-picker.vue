@@ -1,8 +1,8 @@
 <script setup lang="ts">
 import { computed, nextTick, ref, useId, useTemplateRef, watch } from 'vue';
-import type { WorkspaceBranch } from '@glink/protocol/workspace';
+import type { GitReferenceOption } from '@glink/protocol/git';
 const props = defineProps<{
-  branches: readonly WorkspaceBranch[];
+  references: readonly GitReferenceOption[];
   label: string;
   disabled?: boolean;
 }>();
@@ -14,12 +14,17 @@ const id = useId();
 const searchInput = useTemplateRef<HTMLInputElement>('search');
 const trigger = useTemplateRef<HTMLButtonElement>('trigger');
 const filtered = computed(() =>
-  props.branches.filter((branch) =>
-    branch.name.toLocaleLowerCase().includes(search.value.trim().toLocaleLowerCase()),
+  props.references.filter((reference) =>
+    reference.name.toLocaleLowerCase().includes(search.value.trim().toLocaleLowerCase()),
   ),
 );
 watch(search, () => {
   active.value = 0;
+});
+watch(() => props.disabled, (disabled) => {
+  if (disabled) {
+    open.value = false;
+  }
 });
 
 async function toggle() {
@@ -28,15 +33,15 @@ async function toggle() {
     search.value = '';
     active.value = Math.max(
       0,
-      props.branches.findIndex((branch) => branch.revision === selected.value),
+      props.references.findIndex((reference) => reference.ref === selected.value),
     );
     await nextTick();
     searchInput.value!.focus();
   }
 }
 
-function pick(branch: WorkspaceBranch) {
-  selected.value = branch.revision;
+function pick(reference: GitReferenceOption) {
+  selected.value = reference.ref;
   open.value = false;
   trigger.value!.focus();
 }
@@ -79,13 +84,13 @@ function keydown(event: KeyboardEvent) {
 </script>
 <template>
   <div
-    class="branch-select"
+    class="reference-select"
     @keydown="keydown"
     @focusout="focusout"
   >
     <button
       ref="trigger"
-      class="branch-trigger"
+      class="reference-trigger"
       type="button"
       :disabled="disabled"
       :aria-label="label"
@@ -95,6 +100,7 @@ function keydown(event: KeyboardEvent) {
       @click="toggle"
     >
       <svg
+        v-if="!selected.startsWith('refs/tags/')"
         width="16"
         height="16"
         viewBox="0 0 20 20"
@@ -125,8 +131,29 @@ function keydown(event: KeyboardEvent) {
           stroke="currentColor"
         />
       </svg>
+      <svg
+        v-else
+        width="16"
+        height="16"
+        viewBox="0 0 20 20"
+        fill="none"
+        aria-hidden="true"
+      >
+        <path
+          d="M3 3h7l7 7-7 7-7-7V3Z"
+          stroke="currentColor"
+          stroke-width="1.5"
+        />
+        <circle
+          cx="7"
+          cy="7"
+          r="1.4"
+          stroke="currentColor"
+        />
+      </svg>
       <span :title="selected">{{
-        branches.find((branch) => branch.revision === selected)?.name || selected || '选择分支'
+        references.find((reference) => reference.ref === selected)?.name
+          || selected.replace(/^refs\/(heads|remotes|tags)\//, '') || '选择引用'
       }}</span><span
         class="arrow"
         aria-hidden="true"
@@ -134,7 +161,7 @@ function keydown(event: KeyboardEvent) {
     </button>
     <div
       v-if="open"
-      class="branch-popover"
+      class="reference-popover"
     >
       <input
         ref="search"
@@ -150,41 +177,42 @@ function keydown(event: KeyboardEvent) {
       >
       <div
         :id="id"
-        class="branch-options"
+        class="reference-options"
         role="listbox"
         :aria-label="label"
       >
         <button
-          v-for="(branch, index) in filtered"
+          v-for="(reference, index) in filtered"
           :id="`${id}-${index}`"
-          :key="branch.revision"
+          :key="reference.ref"
           type="button"
           role="option"
-          :aria-selected="branch.revision === selected"
-          :title="branch.name"
+          :disabled="disabled"
+          :aria-selected="reference.ref === selected"
+          :title="reference.name"
           :class="{ active: active === index }"
           @mouseenter="active = index"
-          @click="pick(branch)"
+          @click="pick(reference)"
         >
-          <span class="branch-name">{{ branch.name }}</span>
-          <small v-if="branch.current">current</small>
+          <span class="reference-name">{{ reference.name }}</span>
+          <small v-if="reference.current">current</small>
         </button>
         <p
           v-if="!filtered.length"
           class="muted"
         >
-          没有匹配的分支
+          没有匹配的引用
         </p>
       </div>
     </div>
   </div>
 </template>
 <style scoped lang="less">
-.branch-select {
+.reference-select {
   position: relative;
   min-width: 0;
 }
-.branch-trigger {
+.reference-trigger {
   width: 100%;
   display: flex;
   align-items: center;
@@ -195,7 +223,7 @@ function keydown(event: KeyboardEvent) {
   border: 1px solid var(--ws-line);
   background: var(--ws-surface);
 }
-.branch-trigger > span:not(.arrow) {
+.reference-trigger > span:not(.arrow) {
   flex: 1;
   min-width: 0;
   overflow: hidden;
@@ -209,7 +237,7 @@ svg {
   border-left: 1px solid var(--ws-line);
   padding-left: 0.6em;
 }
-.branch-popover {
+.reference-popover {
   position: absolute;
   top: calc(100% + 0.4em);
   left: 0;
@@ -222,18 +250,18 @@ svg {
   background: var(--ws-surface);
   box-shadow: 0 0.5em 2em #242a3420;
 }
-.branch-popover input {
+.reference-popover input {
   width: 100%;
   border: 0;
   border-bottom: 1px solid var(--ws-blue);
   border-radius: 0;
   margin-bottom: 0.5em;
 }
-.branch-options {
+.reference-options {
   max-height: 18em;
   overflow: auto;
 }
-.branch-options button {
+.reference-options button {
   display: flex;
   align-items: center;
   gap: 0.7em;
@@ -241,11 +269,11 @@ svg {
   padding: 0.55em;
   text-align: left;
 }
-.branch-options button.active,
+.reference-options button.active,
 [aria-selected='true'] {
   background: var(--ws-active);
 }
-.branch-name {
+.reference-name {
   flex: 1;
   min-width: 0;
   overflow: hidden;

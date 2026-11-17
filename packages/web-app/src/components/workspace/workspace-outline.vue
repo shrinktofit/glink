@@ -5,7 +5,6 @@ import { appKey } from '../../app-context';
 import { RouteName } from '../../router';
 import {
   WorkspaceConnectionKind,
-  ProjectBindingKind,
   type WorkspaceDocument,
   type WorkspaceProject,
   type WorkspaceProjectStatus,
@@ -58,7 +57,8 @@ function projectTitle(project: WorkspaceProject) {
     project.worktreePath,
     `${clean} · ${project.settled ? 'Settled' : 'Unsettled'}`,
   ];
-  if (value && !value.error && value.baseCommit === project.baseCommit && value.aheadCount) {
+  if (value && !value.error && value.baselineCommit === project.baseline?.commit
+    && value.aheadCount) {
     lines.push(`Ahead ${value.aheadCount} ${value.aheadCount === 1 ? 'commit' : 'commits'}`);
   }
   return lines.join('\n');
@@ -69,9 +69,7 @@ function bindingChanged(project: WorkspaceProject) {
   if (!value || value.error) {
     return false;
   }
-  return project.binding.kind === ProjectBindingKind.branch
-    ? project.binding.revision !== value.branch
-    : project.binding.revision !== value.head;
+  return value.bindingMismatch;
 }
 
 function locked(id: string) {

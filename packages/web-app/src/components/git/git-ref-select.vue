@@ -1,24 +1,28 @@
 <script setup lang="ts">
 import { computed } from 'vue';
-import type { WorkspaceBranch } from '@glink/protocol/workspace';
-import { ProjectBindingKind, type WorkspaceProject } from '@glink/protocol/workspace';
-import GitBranchSelect from './git-branch-select.vue';
+import { GitRevisionKind, type GitReferenceOption, type GitRevision } from '@glink/protocol/git';
+import GitRefPicker from './git-ref-picker.vue';
+
 const props = defineProps<{
-  branches: readonly WorkspaceBranch[];
+  references: readonly GitReferenceOption[];
   label: string;
   disabled?: boolean;
   optional?: boolean;
 }>();
-const selection = defineModel<WorkspaceProject['binding']>({ required: true });
+const selection = defineModel<GitRevision>({ required: true });
+const choices = [
+  { kind: GitRevisionKind.branch, label: '分支' },
+  { kind: GitRevisionKind.tag, label: '标签' },
+  { kind: GitRevisionKind.commit, label: '提交' },
+];
 const kind = computed({
   get: () => selection.value.kind,
-  set: (kind: ProjectBindingKind) => {
-    const revision
-      = kind === ProjectBindingKind.commit
-        ? (props.branches.find((branch) => branch.revision === selection.value.revision)?.sha ?? '')
-        : (props.branches.find((branch) => branch.sha === selection.value.revision)?.revision
-          ?? '');
-    selection.value = { kind, revision };
+  set: (kind: GitRevisionKind) => {
+    const selected = props.references.find((option) => option.ref === selection.value.revision);
+    selection.value = {
+      kind,
+      revision: kind === GitRevisionKind.commit ? selected?.commit ?? '' : '',
+    };
   },
 });
 const revision = computed({
@@ -27,47 +31,35 @@ const revision = computed({
     selection.value = { ...selection.value, revision };
   },
 });
-const invalid = computed(
-  () =>
-    selection.value.kind === ProjectBindingKind.commit
-    && !!revision.value
-    && !/^[a-f0-9]{4,64}$/i.test(revision.value),
-);
+const options = computed(() => props.references.filter((option) => option.kind === kind.value));
+const invalid = computed(() => kind.value === GitRevisionKind.commit
+  && !!revision.value && !/^[a-f0-9]{4,64}$/i.test(revision.value));
 </script>
+
 <template>
   <div class="git-ref-field">
     <div
       class="git-ref-select"
       :aria-label="label"
     >
-      <v-btn-toggle
+      <select
         v-model="kind"
         class="ref-kind"
         :aria-label="`${label}类型`"
         :disabled="disabled"
-        role="group"
-        mandatory
-        divided
-        variant="flat"
-        selected-class="selected"
       >
-        <v-btn
-          type="button"
-          :value="ProjectBindingKind.branch"
+        <option
+          v-for="choice in choices"
+          :key="choice.kind"
+          :value="choice.kind"
         >
-          分支
-        </v-btn>
-        <v-btn
-          type="button"
-          :value="ProjectBindingKind.commit"
-        >
-          提交
-        </v-btn>
-      </v-btn-toggle>
-      <git-branch-select
-        v-if="kind === ProjectBindingKind.branch"
+          {{ choice.label }}
+        </option>
+      </select>
+      <git-ref-picker
+        v-if="kind !== GitRevisionKind.commit"
         v-model="revision"
-        :branches="branches"
+        :references="options"
         :label="label"
         :disabled="disabled"
       />
@@ -84,6 +76,12 @@ const invalid = computed(
         autocomplete="off"
         spellcheck="false"
       >
+      <div
+        v-if="$slots.actions"
+        class="ref-actions"
+      >
+        <slot name="actions" />
+      </div>
     </div>
     <p
       v-if="invalid"
@@ -94,6 +92,7 @@ const invalid = computed(
     </p>
   </div>
 </template>
+
 <style scoped lang="less">
 .git-ref-select {
   display: flex;
@@ -102,22 +101,14 @@ const invalid = computed(
   min-width: 0;
 }
 .ref-kind {
-  flex-shrink: 0;
+  flex: 0 0 5.3em;
   height: 2.7em;
+  padding: 0 0.6em;
+  appearance: auto;
   border: 1px solid var(--ws-line);
   border-radius: 0.45em;
-  :deep(.v-btn) {
-    min-width: 3.5em;
-    padding: 0 0.7em;
-    font: inherit;
-    letter-spacing: normal;
-  }
-  :deep(.selected) {
-    background: var(--ws-active);
-    color: var(--ws-blue);
-  }
 }
-.branch-select,
+.reference-select,
 input {
   flex: 1;
   min-width: 0;
@@ -125,6 +116,11 @@ input {
 input {
   height: 2.7em;
   font-family: Consolas, monospace;
+}
+.ref-actions {
+  display: flex;
+  align-items: center;
+  flex-shrink: 0;
 }
 .validation-error {
   color: var(--ws-red);

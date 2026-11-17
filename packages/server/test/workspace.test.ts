@@ -7,10 +7,9 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { promisify } from 'node:util';
 import process from 'node:process';
-import type { GitReference } from '@glink/protocol/git';
+import { GitRevisionKind, type GitReferenceOption } from '@glink/protocol/git';
 import { parse } from 'yaml';
 import {
-  ProjectBindingKind,
   WorkspaceConnectionKind,
   type GlinkCatalog,
   type WorkspaceCommit,
@@ -436,7 +435,7 @@ describe('Workspace HTTP operations in isolated temporary repositories', () => {
           action: 'stage',
         });
         expect(state.staged.map((file) => file.path)).toEqual(['file.txt']);
-        expect(state.head).toBe(workspace.projects[0].baseCommit);
+        expect(state.head).toBe(workspace.projects[0].baseline?.commit);
         expect(state.indexFingerprint).toMatch(/^[a-f0-9]{64}$/);
         const commands = (await readFile(trace, 'utf8')).trim().split('\n')
           .map((line) => JSON.parse(line) as { event: string; argv?: string[] })
@@ -711,7 +710,7 @@ describe('Workspace HTTP operations in isolated temporary repositories', () => {
       ...first,
       name: 'Application',
       settled: true,
-      binding: { kind: ProjectBindingKind.branch, revision: 'feature' },
+      binding: { kind: GitRevisionKind.branch, revision: 'refs/heads/feature' },
       dependencyIds: [second.id],
     });
     await request(
@@ -729,8 +728,8 @@ describe('Workspace HTTP operations in isolated temporary repositories', () => {
     expect(reopened.projects[0]).toMatchObject({
       name: 'Application',
       settled: true,
-      binding: { kind: 'branch', revision: 'feature' },
-      baseCommit: before,
+      binding: { kind: 'branch', revision: 'refs/heads/feature' },
+      baseline: { commit: before },
     });
     expect(await git(a, 'branch', '--show-current')).toBe('main');
     expect(await git(a, 'rev-parse', 'HEAD')).toBe(before);
@@ -791,7 +790,8 @@ describe('Workspace HTTP operations in isolated temporary repositories', () => {
       'DELETE',
     );
     expect(remaining.projects).toHaveLength(1);
-    expect(await git(join(parent, 'child'), 'rev-parse', 'HEAD')).toBe(childProject.baseCommit);
+    expect(await git(join(parent, 'child'), 'rev-parse', 'HEAD'))
+      .toBe(childProject.baseline?.commit);
   }, 60000);
 
   it('counts commits ahead of each project base', async () => {
@@ -811,19 +811,19 @@ describe('Workspace HTTP operations in isolated temporary repositories', () => {
     expect(ahead.amendBlockedReason).toBeUndefined();
     await request(`${route}/projects/${project.id}`, 'PATCH', {
       ...project,
-      baseCommit: ahead.head,
+      baseline: { commit: ahead.head },
       dependencyIds: [],
     });
     expect((await status()).aheadCount).toBe(0);
-    await git(path, 'checkout', '--detach', project.baseCommit!);
+    await git(path, 'checkout', '--detach', project.baseline!.commit);
     expect((await status()).aheadCount).toBe(0);
     await git(path, 'commit', '--allow-empty', '-m', 'Divergent');
     const divergent = await status();
     expect(divergent.aheadCount).toBe(1);
-    expect(divergent.amendBlockedReason).toContain('基础提交');
+    expect(divergent.amendBlockedReason).toContain('基线');
     await request(`${route}/projects/${project.id}`, 'PATCH', {
       ...project,
-      baseCommit: '',
+      baseline: undefined,
       dependencyIds: [],
     });
     expect((await status()).aheadCount).toBeUndefined();
@@ -1011,33 +1011,33 @@ describe('Workspace HTTP operations in isolated temporary repositories', () => {
     const workspace = await create([path]);
     const project = workspace.projects[0];
     await git(path, 'branch', 'release/base');
-    await git(path, 'update-ref', 'refs/remotes/origin/main', project.baseCommit!);
+    await git(path, 'update-ref', 'refs/remotes/origin/main', project.baseline!.commit);
     await git(path, 'symbolic-ref', 'refs/remotes/origin/HEAD', 'refs/remotes/origin/main');
     await writeFile(join(path, 'file.txt'), 'focused change\n');
     await git(path, 'commit', '-am', 'Focused change');
-    const branches = await request<GitReference[]>(
-      `workspaces/${workspace.id}/projects/${project.id}/branches`,
+    const branches = await request<GitReferenceOption[]>(
+      `workspaces/${workspace.id}/projects/${project.id}/references`,
     );
     expect(branches).toContainEqual(expect.objectContaining({
       name: 'release/base',
-      sha: project.baseCommit,
+      commit: project.baseline?.commit,
       current: false,
     }));
     expect(branches).toContainEqual(expect.objectContaining({
       name: 'origin/main',
-      sha: project.baseCommit,
+      commit: project.baseline?.commit,
       current: false,
     }));
     expect(branches.find((branch) => branch.current)?.name).toBe('main');
     expect(branches.some((branch) => branch.name === 'origin/HEAD')).toBe(false);
     await request(`workspaces/${workspace.id}/projects/${project.id}`, 'PATCH', {
       ...project,
-      baseCommit: 'release/base',
+      baseline: { commit: project.baseline!.commit, ref: 'refs/heads/release/base' },
       dependencyIds: [],
     });
     await git(path, 'update-ref', 'refs/heads/release/base', 'HEAD');
     const reopened = await request<WorkspaceDocument>(`workspaces/${workspace.id}`);
-    expect(reopened.projects[0].baseCommit).toBe(project.baseCommit);
+    expect(reopened.projects[0].baseline?.commit).toBe(project.baseline?.commit);
     const history = await request<{ commits: WorkspaceCommit[] }>(
       `workspaces/${workspace.id}/commits`,
     );
@@ -1050,17 +1050,17 @@ describe('Workspace HTTP operations in isolated temporary repositories', () => {
     const path = await repository('project');
     const workspace = await create([path]);
     const project = workspace.projects[0];
-    const sha = project.baseCommit!;
+    const sha = project.baseline!.commit;
     const input = {
       ...project,
-      baseCommit: sha.slice(0, 8).toUpperCase(),
-      binding: { kind: ProjectBindingKind.commit, revision: sha.slice(0, 8).toUpperCase() },
+      baseline: { commit: sha.slice(0, 8).toUpperCase() },
+      binding: { kind: GitRevisionKind.commit, revision: sha.slice(0, 8).toUpperCase() },
       dependencyIds: [],
     };
     const saved = await request<WorkspaceDocument>(
       `workspaces/${workspace.id}/projects/${project.id}`, 'PATCH', input);
     expect(saved.projects[0].binding.revision).toBe(sha);
-    expect(saved.projects[0].baseCommit).toBe(sha);
+    expect(saved.projects[0].baseline?.commit).toBe(sha);
     const blob = await git(path, 'hash-object', 'file.txt');
     for (const revision of [
       'HEAD',
@@ -1070,7 +1070,7 @@ describe('Workspace HTTP operations in isolated temporary repositories', () => {
     ]) {
       await request(`workspaces/${workspace.id}/projects/${project.id}`, 'PATCH', {
         ...input,
-        binding: { kind: ProjectBindingKind.commit, revision },
+        binding: { kind: GitRevisionKind.commit, revision },
       }, 400);
     }
     const reopened = await request<WorkspaceDocument>(`workspaces/${workspace.id}`);
@@ -1079,7 +1079,7 @@ describe('Workspace HTTP operations in isolated temporary repositories', () => {
     const remote = await request<WorkspaceDocument>(
       `workspaces/${workspace.id}/projects/${project.id}`, 'PATCH', {
         ...input,
-        binding: { kind: ProjectBindingKind.branch, revision: 'refs/remotes/origin/main' },
+        binding: { kind: GitRevisionKind.branch, revision: 'refs/remotes/origin/main' },
       });
     expect(remote.projects[0].binding.revision).toBe('refs/remotes/origin/main');
   }, 60000);
@@ -1148,30 +1148,30 @@ describe('Workspace HTTP operations in isolated temporary repositories', () => {
       amend: true,
       expected: await statuses(),
     }, 409);
-    expect((await statuses())[0].amendBlockedReason).toContain('基础提交');
-    expect((await attempt([project.id])).error).toContain('基础提交');
+    expect((await statuses())[0].amendBlockedReason).toContain('基线');
+    expect((await attempt([project.id])).error).toContain('基线');
     await git(a, 'commit', '--allow-empty', '-m', 'After base');
     const newer = await git(a, 'rev-parse', 'HEAD');
     expect((await statuses())[0].amendBlockedReason).toBeUndefined();
-    expect((await attempt([project.id, other.id])).error).toContain('基础提交');
+    expect((await attempt([project.id, other.id])).error).toContain('基线');
     await git(b, 'commit', '--allow-empty', '-m', 'After base too');
     expect((await attempt([project.id, other.id])).error).toContain('一个');
     await request(`${route}/projects/${project.id}`, 'PATCH', {
       ...project,
-      baseCommit: newer,
+      baseline: { commit: newer },
       dependencyIds: [],
     });
-    await git(a, 'reset', '--hard', project.baseCommit!);
-    expect((await attempt([project.id])).error).toContain('基础提交');
+    await git(a, 'reset', '--hard', project.baseline!.commit);
+    expect((await attempt([project.id])).error).toContain('基线');
     await git(a, 'commit', '--allow-empty', '-m', 'Divergent');
-    expect((await attempt([project.id])).error).toContain('基础提交');
+    expect((await attempt([project.id])).error).toContain('基线');
     expect(await git(a, 'log', '-1', '--format=%s')).toBe('Divergent');
     await request(`${route}/projects/${project.id}`, 'PATCH', {
       ...project,
-      baseCommit: '',
+      baseline: undefined,
       dependencyIds: [],
     });
-    expect((await attempt([project.id])).error).toContain('基础提交');
+    expect((await attempt([project.id])).error).toContain('基线');
   }, 60000);
 
   it('amends one project without absorbing unstaged edits or touching its parent', async () => {
@@ -1196,7 +1196,7 @@ describe('Workspace HTTP operations in isolated temporary repositories', () => {
     const result = await amend(first);
     expect(result.failed).toBeUndefined();
     expect(result.committed.map((entry) => entry.projectId)).toEqual([project.id]);
-    expect(await git(child, 'rev-parse', 'HEAD^')).toBe(project.baseCommit);
+    expect(await git(child, 'rev-parse', 'HEAD^')).toBe(project.baseline?.commit);
     await amend(first, 409);
     const beforeIndex = await statuses();
     await writeFile(join(child, 'file.txt'), 'staged\n');
@@ -1210,7 +1210,7 @@ describe('Workspace HTTP operations in isolated temporary repositories', () => {
     const beforeBase = await statuses();
     await request(`${route}/projects/${project.id}`, 'PATCH', {
       ...project,
-      baseCommit: await git(child, 'rev-parse', 'HEAD'),
+      baseline: { commit: await git(child, 'rev-parse', 'HEAD') },
       dependencyIds: [],
     });
     await amend(beforeBase, 409);
@@ -1314,7 +1314,7 @@ describe('Workspace HTTP operations in isolated temporary repositories', () => {
     expect(result.committed.map((entry) => entry.projectId)).toEqual([project.id]);
     expect(await git(parent, 'rev-parse', 'HEAD')).toBe(parentHead);
     expect(await git(parent, 'ls-files', '--stage', 'child')).toBe(pointer);
-    expect(await git(child, 'rev-parse', 'HEAD^')).toBe(project.baseCommit);
+    expect(await git(child, 'rev-parse', 'HEAD^')).toBe(project.baseline?.commit);
   }, 60000);
 
   it.each([false, true])('skips dirty pointers; parent staged files: %s', async (staged) => {

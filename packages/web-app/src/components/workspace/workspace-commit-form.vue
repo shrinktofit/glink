@@ -39,7 +39,8 @@ const projectAmendBlockedReason = computed(() => {
   for (const id of selected.value) {
     const status = props.statuses.find((item) => item.projectId === id);
     const project = props.workspace.projects.find((item) => item.id === id)!;
-    if (!status || status.error || !status.head || status.baseCommit !== project.baseCommit) {
+    if (!status || status.error || !status.head
+      || status.baselineCommit !== project.baseline?.commit) {
       return `${project.name}: 等待有效的项目状态。`;
     }
     if (status.amendBlockedReason) {

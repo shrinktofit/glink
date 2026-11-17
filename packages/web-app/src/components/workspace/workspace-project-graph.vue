@@ -87,7 +87,9 @@ function edgePath(from: string, to: string) {
         >
           <strong>{{ node.name }}</strong>
           <small>{{ liveState(node.id) }}</small>
-          <span>{{ node.binding.revision.slice(0, 28) }}</span>
+          <span>{{
+            node.binding.revision.replace(/^refs\/(heads|remotes|tags)\//, '').slice(0, 28)
+          }}</span>
           <small :class="{ settled: node.settled }">{{
             node.settled ? '✓ Settled' : '○ Unsettled'
           }}</small>

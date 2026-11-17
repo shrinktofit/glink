@@ -4,7 +4,8 @@ import {
   type ToolInput,
   type ToolResults,
 } from '@glink/protocol/tools';
-import { WorkspaceError, type WorkspaceStore } from '../workspace/workspace-store.ts';
+import type { WorkspaceStore } from '../workspace/workspace-store.ts';
+import { WorkspaceError } from '../workspace/workspace-error.ts';
 
 function parseToolInput<Name extends GlinkToolName>(
   name: Name,

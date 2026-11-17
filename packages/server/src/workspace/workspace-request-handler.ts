@@ -17,8 +17,9 @@ import {
 import { changeAllIndex, changeIndex, readFileDiff } from '../git/worktree.ts';
 import { handleRequest } from '../request-handler.ts';
 import { commitWorkspace, workspaceHistory, workspaceStatuses } from './workspace-operations.ts';
-import { WorkspaceError, WorkspaceStore } from './workspace-store.ts';
-import { readProjectBranches } from './workspace-git.ts';
+import { WorkspaceStore } from './workspace-store.ts';
+import { WorkspaceError } from './workspace-error.ts';
+import { readBaselineComparison, readProjectReferences } from './project-references.ts';
 import { GitIndexLockedError } from '../git/git-index-locked-error.ts';
 import { GitSubmoduleDirtyError } from '../git/git-submodule-dirty-error.ts';
 
@@ -142,8 +143,14 @@ export async function createGlinkRequestHandler(options: { glinkHome: string }) 
       await store.remove(id);
       result = {};
     } else if (id && section === 'projects' && projectId
-      && parts[3] === 'branches' && method === 'GET') {
-      result = await readProjectBranches(store.project(await store.get(id), projectId));
+      && parts[3] === 'references' && method === 'GET') {
+      result = await readProjectReferences(store.project(await store.get(id), projectId), signal);
+    } else if (id && section === 'projects' && projectId
+      && parts[3] === 'baseline-comparison' && method === 'GET') {
+      result = await readBaselineComparison(store.project(await store.get(id), projectId), {
+        commit: url.searchParams.get('commit') ?? '',
+        ref: url.searchParams.get('ref') ?? '',
+      }, signal);
     } else if (id && section === 'projects' && method === 'POST' && !projectId) {
       const input = await body<{ worktreePath: string; parentId?: string }>(request);
       result = await store.addProject(id, input.worktreePath, input.parentId);
@@ -182,7 +189,7 @@ export async function createGlinkRequestHandler(options: { glinkHome: string }) 
       result = {
         ...await changeAllIndex(project.worktreePath, input.action, input.directory),
         projectId: project.id,
-        baseCommit: project.baseCommit,
+        baselineCommit: project.baseline?.commit,
       };
     } else if (id && section === 'index' && method === 'POST') {
       const input = await body<{ projectId: string; path: string; action: GitIndexAction }>(
@@ -195,7 +202,7 @@ export async function createGlinkRequestHandler(options: { glinkHome: string }) 
       result = {
         ...await changeIndex(project.worktreePath, input.path, input.action),
         projectId: project.id,
-        baseCommit: project.baseCommit,
+        baselineCommit: project.baseline?.commit,
       };
     } else {
       throw new WorkspaceError('Workspace endpoint not found.', 404);

@@ -1,6 +1,6 @@
 import { z } from 'zod';
+import { GitRevisionKind } from './git';
 import {
-  ProjectBindingKind,
   type WorkspaceDocument,
   type WorkspaceSummary,
 } from './workspace';
@@ -41,7 +41,7 @@ const projectId = {
 };
 
 const binding = z.strictObject({
-  kind: z.enum(ProjectBindingKind),
+  kind: z.enum(GitRevisionKind),
   revision: z.string().trim().min(1),
 });
 
@@ -54,7 +54,8 @@ export const workspaceTools = {
   },
 
   [GlinkToolName.getWorkspace]: {
-    description: 'Read saved projects, paths, base commits, associations, Settled states '
+    description: 'Read saved projects, paths, pinned baselines (commit and optional source ref), '
+      + 'associations, Settled states '
       + 'and dependencies. Does not refresh Git status or synchronize submodules; '
       + 'use sync_workspace explicitly.',
     access: ToolAccess.read,
@@ -104,8 +105,11 @@ export const workspaceTools = {
 
   [GlinkToolName.updateProject]: {
     description: 'Atomically patch only supplied Glink project fields. '
-      + 'Association changes do not checkout Git. baseCommit accepts a valid revision and stores '
-      + 'its full SHA; an empty string clears it. manualDependencyIds replaces manual outgoing '
+      + 'Association changes do not checkout Git. Named associations use full refs/heads/, '
+      + 'refs/remotes/ or refs/tags/ names. '
+      + 'baseline pins a commit SHA with an optional source ref; '
+      + 'it never follows that ref automatically. Use null to clear baseline. '
+      + 'manualDependencyIds replaces manual outgoing '
       + 'dependencies; automatic submodule edges stay.',
     access: ToolAccess.write,
     inputSchema: z.strictObject({
@@ -113,7 +117,10 @@ export const workspaceTools = {
       changes: z.strictObject({
         name: z.string().trim().min(1).optional(),
         settled: z.boolean().optional(),
-        baseCommit: z.string().optional(),
+        baseline: z.strictObject({
+          commit: z.string().trim().regex(/^[a-f0-9]{4,64}$/i),
+          ref: z.string().trim().min(1).optional(),
+        }).nullable().optional(),
         binding: binding.optional(),
         manualDependencyIds: z.array(identifier).optional(),
       }).refine(

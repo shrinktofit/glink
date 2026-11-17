@@ -391,7 +391,7 @@ async function index(projectId: string, staged: boolean, target: GitIndexTarget)
       const previous = statuses.value.find((status) => status.projectId === state.projectId);
       const metadataStale = !previous || !!previous.error || staleMetadataIds.has(state.projectId)
         || previous.head !== state.head
-        || previous.baseCommit !== state.baseCommit;
+        || previous.baselineCommit !== state.baselineCommit;
       if (metadataStale) {
         staleMetadataIds.add(state.projectId);
       }
@@ -448,7 +448,7 @@ async function commit(projectIds: string[], message: string, amend: boolean) {
       expected: statuses.value.map((status) => ({
         projectId: status.projectId,
         head: status.head,
-        baseCommit: status.baseCommit,
+        baselineCommit: status.baselineCommit,
         indexFingerprint: status.indexFingerprint,
       })),
     });

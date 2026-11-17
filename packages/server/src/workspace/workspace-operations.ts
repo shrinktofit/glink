@@ -11,7 +11,8 @@ import {
 } from '@glink/protocol/workspace';
 import { GitIndexTransaction } from '../git/worktree.ts';
 import { readProjectCommits, readProjectStatus } from './workspace-git.ts';
-import { WorkspaceError, WorkspaceStore } from './workspace-store.ts';
+import { WorkspaceStore } from './workspace-store.ts';
+import { WorkspaceError } from './workspace-error.ts';
 
 export async function workspaceStatuses(
   projects: readonly WorkspaceProject[], signal?: AbortSignal,
@@ -99,7 +100,7 @@ export async function commitWorkspace(
       !expected
       || status.head !== expected.head
       || status.indexFingerprint !== expected.indexFingerprint
-      || (input.amend && status.baseCommit !== expected.baseCommit)
+      || (input.amend && status.baselineCommit !== expected.baselineCommit)
     ) {
       throw new WorkspaceError(
         `${project.name} changed. Refresh and review its staged changes.`,
@@ -146,7 +147,7 @@ export async function commitWorkspace(
         const currentProject = store.project(await store.get(id), projectId);
         const current = await readProjectStatus(currentProject);
         if (current.head !== before.head || current.indexFingerprint !== before.indexFingerprint
-          || (input.amend && current.baseCommit !== before.baseCommit)) {
+          || (input.amend && current.baselineCommit !== before.baselineCommit)) {
           throw new WorkspaceError(`${project.name} changed during the workspace commit.`, 409);
         }
         for (const edge of document.connections.filter(

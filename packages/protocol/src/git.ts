@@ -18,6 +18,26 @@ export interface GitReference {
   current: boolean;
 }
 
+export enum GitRevisionKind {
+  branch = 'branch',
+  tag = 'tag',
+  commit = 'commit',
+}
+
+export interface GitRevision {
+  kind: GitRevisionKind;
+  revision: string;
+}
+
+/** A selectable named reference, always peeled to a commit object. */
+export interface GitReferenceOption {
+  ref: string;
+  name: string;
+  kind: GitRevisionKind.branch | GitRevisionKind.tag;
+  commit: string;
+  current: boolean;
+}
+
 export interface GitWorktree {
   path: string;
   head?: string;

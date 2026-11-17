@@ -98,7 +98,7 @@ const links = computed(() =>
       v-else
       class="ws-empty"
     >
-      {{ loading ? '正在读取提交…' : '基础提交与 HEAD 之间没有提交' }}
+      {{ loading ? '正在读取提交…' : '基线与 HEAD 之间没有提交' }}
     </p>
   </div>
 </template>

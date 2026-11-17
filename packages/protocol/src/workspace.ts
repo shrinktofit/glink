@@ -1,27 +1,41 @@
-import type { ChangesSnapshot, GitCommit, GitReference, WorktreeStatus } from './git';
-export interface WorkspaceBranch extends GitReference {
-  revision: string;
-}
+import type { ChangesSnapshot, GitCommit, GitRevision, WorktreeStatus } from './git';
 
 export const glinkStatePath = '/api/glink/state';
 export const workspacesPath = '/api/workspaces';
 
-export enum ProjectBindingKind {
-  branch = 'branch',
-  commit = 'commit',
-}
 export enum WorkspaceConnectionKind {
   manual = 'manual',
   submodule = 'submodule',
 }
 
+export interface ProjectBaseline {
+  /** Full commit object ID; ref changes never move this snapshot automatically. */
+  commit: string;
+  ref?: string;
+}
+
+export enum BaselineRefState {
+  available = 'available',
+  missing = 'missing',
+}
+
+/** Counts are relative to the pinned baseline, never relative to HEAD. */
+export type BaselineRefComparison = {
+  state: BaselineRefState.available;
+  commit: string;
+  aheadCount: number;
+  behindCount: number;
+} | {
+  state: BaselineRefState.missing;
+};
+
 export interface WorkspaceProject {
   id: string;
   name: string;
   worktreePath: string;
-  baseCommit?: string;
+  baseline?: ProjectBaseline;
   settled: boolean;
-  binding: { kind: ProjectBindingKind; revision: string };
+  binding: GitRevision;
 }
 
 export interface WorkspaceConnection {
@@ -31,7 +45,7 @@ export interface WorkspaceConnection {
 }
 
 export interface WorkspaceDocument {
-  version: 1;
+  version: 2;
   id: string;
   name: string;
   createdAt: string;
@@ -66,7 +80,7 @@ export interface CreateWorkspaceInput {
 export interface UpdateProjectInput {
   name: string;
   settled: boolean;
-  baseCommit?: string;
+  baseline?: ProjectBaseline;
   binding: WorkspaceProject['binding'];
   dependencyIds: string[];
 }
@@ -75,24 +89,25 @@ export interface UpdateProjectInput {
 export interface PatchProjectInput {
   name?: string;
   settled?: boolean;
-  baseCommit?: string;
+  baseline?: ProjectBaseline | null;
   binding?: WorkspaceProject['binding'];
   manualDependencyIds?: string[];
 }
 
 export interface WorkspaceProjectStatus extends WorktreeStatus {
   projectId: string;
-  baseCommit?: string;
-  /** Commits reachable from HEAD but not from baseCommit. */
+  baselineCommit?: string;
+  /** Commits reachable from HEAD but not from the pinned baseline. */
   aheadCount?: number;
   error?: string;
   /** Base/HEAD ancestry restriction, independent of dirty staged gitlinks. */
   baseAmendBlockedReason?: string;
+  bindingMismatch?: boolean;
 }
 
 export interface WorkspaceChangesSnapshot extends ChangesSnapshot {
   projectId: string;
-  baseCommit?: string;
+  baselineCommit?: string;
 }
 
 export interface WorkspaceCommit extends GitCommit {
@@ -106,7 +121,7 @@ export interface WorkspaceCommitInput {
   expected: Array<{
     projectId: string;
     head?: string;
-    baseCommit?: string;
+    baselineCommit?: string;
     indexFingerprint: string;
   }>;
 }
