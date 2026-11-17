@@ -14,7 +14,7 @@ import {
   type UpdateProjectInput,
   type WorkspaceCommitInput,
 } from '@glink/protocol/workspace';
-import { changeAllIndex, changeIndex, readFileDiff } from '../git/worktree.ts';
+import { changeAllIndex, changeIndex, changeIndexPaths, readFileDiff } from '../git/worktree.ts';
 import { handleRequest } from '../request-handler.ts';
 import { commitWorkspace, workspaceHistory, workspaceStatuses } from './workspace-operations.ts';
 import { WorkspaceStore } from './workspace-store.ts';
@@ -188,6 +188,23 @@ export async function createGlinkRequestHandler(options: { glinkHome: string }) 
       const project = store.project(await store.get(id), input.projectId);
       result = {
         ...await changeAllIndex(project.worktreePath, input.action, input.directory),
+        projectId: project.id,
+        baselineCommit: project.baseline?.commit,
+      };
+    } else if (id && section === 'index-paths' && method === 'POST') {
+      const input = await body<{
+        projectId: string;
+        paths: string[];
+        action: GitIndexAction;
+      }>(request);
+      if (!Object.values(GitIndexAction).includes(input.action)
+        || !Array.isArray(input.paths) || !input.paths.length
+        || !input.paths.every((path) => typeof path === 'string' && path.length > 0)) {
+        throw new WorkspaceError('paths and a valid index action are required.');
+      }
+      const project = store.project(await store.get(id), input.projectId);
+      result = {
+        ...await changeIndexPaths(project.worktreePath, input.paths, input.action),
         projectId: project.id,
         baselineCommit: project.baseline?.commit,
       };

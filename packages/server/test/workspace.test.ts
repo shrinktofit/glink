@@ -415,7 +415,12 @@ describe('Workspace HTTP operations in isolated temporary repositories', () => {
     }
   }, 20000);
 
-  it.each(['workspace', 'repository'])(
+  it.each([
+    'workspace',
+    'repository',
+    'workspace-selection',
+    'repository-selection',
+  ])(
     'uses scoped validation and one changes scan for %s staging', async (mode) => {
       /// @case A normal tracked file is staged through the public API with Git tracing enabled.
       /// @expect Validate its path, read changes once, and avoid HEAD metadata queries.
@@ -427,11 +432,15 @@ describe('Workspace HTTP operations in isolated temporary repositories', () => {
       const previous = process.env.GIT_TRACE2_EVENT;
       process.env.GIT_TRACE2_EVENT = trace.replaceAll('\\', '/');
       try {
-        const route = mode === 'workspace' ? `workspaces/${workspace.id}/index` : 'git/index';
+        const selection = mode.endsWith('-selection');
+        const endpoint = selection ? 'index-paths' : 'index';
+        const route = mode.startsWith('workspace')
+          ? `workspaces/${workspace.id}/${endpoint}`
+          : `git/${endpoint}`;
         const state = await request<WorkspaceProjectStatus>(route, 'POST', {
           projectId,
           repoPath: path,
-          path: 'file.txt',
+          ...(selection ? { paths: ['file.txt'] } : { path: 'file.txt' }),
           action: 'stage',
         });
         expect(state.staged.map((file) => file.path)).toEqual(['file.txt']);
@@ -513,6 +522,64 @@ describe('Workspace HTTP operations in isolated temporary repositories', () => {
       action: 'stage',
     });
     expect(staged.submodulePaths).toEqual(['child']);
+  }, 60000);
+
+  it.each(['workspace', 'repository'])('batches %s paths in one index write', async (mode) => {
+    /// @case Select several files, a dirty pointer and a duplicate path through either HTTP API.
+    /// @expect Write the index once, skip the dirty pointer and leave unselected changes untouched.
+    const source = await repository('source');
+    const parent = await repository('parent');
+    await git(parent, '-c', 'protocol.file.allow=always', 'submodule', 'add', source, 'child');
+    await git(parent, 'commit', '-am', 'Add child');
+    const workspace = await create([parent]);
+    const child = join(parent, 'child');
+    const pointer = await git(parent, 'rev-parse', ':child');
+    await git(child, 'commit', '--allow-empty', '-m', 'Advance');
+    await writeFile(join(child, 'file.txt'), 'dirty child\n');
+    await writeFile(join(parent, 'file.txt'), 'parent edit\n');
+    await writeFile(join(parent, 'new [文件].txt'), 'new\n');
+    await writeFile(join(parent, 'keep.txt'), 'keep\n');
+    const route = mode === 'workspace' ? `workspaces/${workspace.id}/index-paths` : 'git/index-paths';
+    const input = {
+      projectId: workspace.projects[0].id,
+      repoPath: parent,
+      paths: [
+        'file.txt',
+        'new [文件].txt',
+        'child',
+        'file.txt',
+      ],
+    };
+    const trace = join(directory, 'batch-trace.json');
+    const previous = process.env.GIT_TRACE2_EVENT;
+    process.env.GIT_TRACE2_EVENT = trace.replaceAll('\\', '/');
+    try {
+      const state = await request<WorkspaceProjectStatus>(route, 'POST', {
+        ...input,
+        action: 'stage',
+      });
+      expect(state.staged.map((file) => file.path)).toEqual(['file.txt', 'new [文件].txt']);
+      expect(state.unstaged.map((file) => file.path)).toEqual(['child', 'keep.txt']);
+      const commands = (await readFile(trace, 'utf8')).trim().split('\n')
+        .map((line) => JSON.parse(line) as { event: string; argv?: string[] })
+        .filter((event) => event.event === 'start').map((event) => event.argv!);
+      expect(commands.filter((args) => args.includes('add'))).toHaveLength(1);
+      expect(commands.some((args) => args.includes('log'))).toBe(false);
+      expect(commands.some((args) => args.includes('rev-list'))).toBe(false);
+    } finally {
+      if (previous === undefined) {
+        delete process.env.GIT_TRACE2_EVENT;
+      } else {
+        process.env.GIT_TRACE2_EVENT = previous;
+      }
+    }
+    expect(await git(parent, 'rev-parse', ':child')).toBe(pointer);
+    expect(await git(child, 'diff', '--cached', '--name-only')).toBe('');
+    await request(route, 'POST', { ...input, action: 'unstage' });
+    expect(await git(parent, 'diff', '--cached', '--name-only')).toBe('');
+    expect(await readFile(join(parent, 'file.txt'), 'utf8')).toBe('parent edit\n');
+    await request(route, 'POST', { ...input, paths: [], action: 'stage' }, 400);
+    await request(route, 'POST', { ...input, paths: ['file.txt', 42], action: 'stage' }, 400);
   }, 60000);
 
   it.each(['workspace', 'repository'])('scopes %s actions by directory', async (mode) => {

@@ -18,18 +18,30 @@ export function orderGitChanges(
 export function nextChangeAfterIndex(
   before: readonly GitChangeEntry[],
   after: readonly GitChangeEntry[],
-  operation: GitIndexTarget & { worktreePath: string; action: GitIndexAction },
+  operations: ReadonlyArray<GitIndexTarget & { worktreePath: string; action: GitIndexAction }>,
 ): GitChangeEntry | undefined {
+  const requests = operations.map((operation) => ({
+    operation,
+    paths: operation.scope === GitIndexScope.paths ? new Set(operation.paths) : undefined,
+  }));
   let last = -1;
   before.forEach((entry, index) => {
-    if (entry.worktreePath !== operation.worktreePath
-      || (operation.action === GitIndexAction.stage && entry.file.stageBlockedReason)) {
-      return;
-    }
-    const affected = operation.scope === GitIndexScope.worktree
-      || (operation.scope === GitIndexScope.file
-        ? entry.file.path === operation.path
-        : entry.file.path.startsWith(`${operation.path}/`));
+    const affected = requests.some(({ operation, paths }) => {
+      if (entry.worktreePath !== operation.worktreePath
+        || (operation.action === GitIndexAction.stage && entry.file.stageBlockedReason)) {
+        return false;
+      }
+      switch (operation.scope) {
+      case GitIndexScope.worktree:
+        return true;
+      case GitIndexScope.paths:
+        return paths!.has(entry.file.path);
+      case GitIndexScope.file:
+        return entry.file.path === operation.path;
+      case GitIndexScope.directory:
+        return entry.file.path.startsWith(`${operation.path}/`);
+      }
+    });
     if (affected) {
       last = index;
     }

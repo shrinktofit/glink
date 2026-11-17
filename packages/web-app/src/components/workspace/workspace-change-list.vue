@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, ref, watch } from 'vue';
+import { computed, provide, ref, watch } from 'vue';
 import { GitIndexAction, type GitFileChange } from '@glink/protocol/git';
 import type { WorkspaceDocument, WorkspaceProjectStatus } from '@glink/protocol/workspace';
 import DiffTree from '../diff-tree.vue';
@@ -7,31 +7,43 @@ import TreeDisclosure from '../tree-disclosure.vue';
 import { useExpansionState } from '../../ui-state/use-expansion-state';
 import { useExpansionStateStore } from '../../ui-state/expansion-state-store';
 import { gitChangesTreeStateKey } from '../../git/git-changes-tree-state-key';
-import { GitIndexScope, type GitIndexTarget } from '../../git/git-index-target';
+import { GitIndexScope } from '../../git/git-index-target';
+import type {
+  PendingWorkspaceIndex,
+  WorkspaceIndexTarget,
+} from '../../workspace/workspace-index-target';
 import { workspaceChangeGroups } from '../../workspace/workspace-change-groups';
+import { fileTreeSelectionScopeKey, type FileTreeSelectionScope } from '../file-tree-selection';
 const props = defineProps<{
   workspace: WorkspaceDocument;
   projectIds: readonly string[];
   statuses: WorkspaceProjectStatus[];
   staged: boolean;
   selected?: { projectId: string; path: string; staged: boolean };
-  pendingIndex?: { projectId: string; path?: string };
+  selection: FileTreeSelectionScope;
+  pendingIndex: readonly PendingWorkspaceIndex[];
   busy: boolean;
   loading: boolean;
 }>();
 const grouped = computed(() => props.projectIds.length > 1);
 const emit = defineEmits<{
   select: [projectId: string, file: GitFileChange];
-  index: [projectId: string, target: GitIndexTarget];
+  index: [targets: readonly WorkspaceIndexTarget[]];
 }>();
 const groups = computed(() => workspaceChangeGroups(
   props.workspace.projects, props.statuses, props.projectIds, props.staged,
 ));
+provide(fileTreeSelectionScopeKey, props.selection);
+const changeGroups = computed(() => groups.value.map((group) => ({
+  id: group.project.id,
+  repoPath: group.project.worktreePath,
+  files: group.files,
+})));
 const count = computed(() => groups.value.reduce((sum, group) => sum + group.files.length, 0));
 
 function changeIndex(projectId: string, file: GitFileChange) {
   if (!props.busy && !props.loading && (props.staged || !file.stageBlockedReason)) {
-    emit('index', projectId, { scope: GitIndexScope.file, path: file.path });
+    emit('index', [{ projectId, scope: GitIndexScope.file, path: file.path }]);
   }
 }
 
@@ -75,7 +87,7 @@ function changeAll() {
   if (canChangeAll.value) {
     const projectId = context.value!.projectId;
     context.value = undefined;
-    emit('index', projectId, { scope: GitIndexScope.worktree });
+    emit('index', [{ projectId, scope: GitIndexScope.worktree }]);
   }
 }
 
@@ -103,6 +115,15 @@ watch(() => [props.statuses, props.workspace.projects], () => {
 function toggleProject(id: string) {
   setExpanded([id], !isExpanded(id));
 }
+
+function pendingPaths(projectId: string) {
+  const pending = props.pendingIndex.find((entry) => entry.projectId === projectId);
+  if (!pending) {
+    return [];
+  }
+  return pending.paths ?? groups.value.find((group) => group.project.id === projectId)!.files
+    .map((file) => file.path);
+}
 </script>
 <template>
   <section
@@ -117,7 +138,7 @@ function toggleProject(id: string) {
         v-for="group in groups"
         :key="group.project.id"
         class="group"
-        :aria-busy="pendingIndex?.projectId === group.project.id && pendingIndex.path === undefined"
+        :aria-busy="pendingIndex.some((entry) => entry.projectId === group.project.id)"
       >
         <h3
           v-if="grouped"
@@ -149,18 +170,15 @@ function toggleProject(id: string) {
           <diff-tree
             :items="group.files"
             :repo-path="group.project.worktreePath"
+            :change-groups="changeGroups"
             :state-key="gitChangesTreeStateKey(group.project.worktreePath, staged)"
             :data-ready="!group.error"
+            :selection-group="group.project.id"
+            :selection-visible="!grouped || isExpanded(group.project.id)"
             reveal-selection
             :index-action="staged ? GitIndexAction.unstage : GitIndexAction.stage"
             :index-disabled="busy || loading"
-            :disabled-paths="
-              pendingIndex?.projectId === group.project.id
-                ? pendingIndex.path === undefined
-                  ? group.files.map((file) => file.path)
-                  : [pendingIndex.path]
-                : undefined
-            "
+            :disabled-paths="pendingPaths(group.project.id)"
             :model-value="
               selected?.projectId === group.project.id && selected.staged === staged
                 ? selected.path
@@ -169,8 +187,17 @@ function toggleProject(id: string) {
             @select="emit('select', group.project.id, $event)"
             @activate="changeIndex(group.project.id, $event)"
             @index-directory="
-              emit('index', group.project.id, { scope: GitIndexScope.directory, path: $event })
+              emit('index', [{
+                projectId: group.project.id,
+                scope: GitIndexScope.directory,
+                path: $event,
+              }])
             "
+            @index-selection="emit('index', $event.map((batch) => ({
+              projectId: batch.group,
+              scope: GitIndexScope.paths,
+              paths: batch.paths,
+            })))"
           >
             <template #actions="{ item }">
               <button

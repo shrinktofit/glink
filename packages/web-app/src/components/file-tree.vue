@@ -1,5 +1,13 @@
 <script setup lang="ts" generic="T extends FileTreeEntry">
-import { computed, nextTick, useTemplateRef, watch } from 'vue';
+import {
+  computed,
+  inject,
+  nextTick,
+  onBeforeUnmount,
+  useTemplateRef,
+  watch,
+  watchEffect,
+} from 'vue';
 import {
   buildFileTree,
   fileTreePathsOverlap,
@@ -7,6 +15,12 @@ import {
   type FileTreeEntry,
   type FileTreeNode,
 } from './file-tree';
+import {
+  createFileTreeSelection,
+  fileTreeSelectionKey,
+  fileTreeSelectionScopeKey,
+  type FileTreeSelectionEntry,
+} from './file-tree-selection';
 import TreeDisclosure from './tree-disclosure.vue';
 import { useExpansionState } from '../ui-state/use-expansion-state';
 
@@ -18,6 +32,9 @@ const props = withDefaults(defineProps<{
   stateKey?: string;
   dataReady?: boolean;
   revealSelection?: boolean;
+  multiple?: boolean;
+  selectionGroup?: string;
+  selectionVisible?: boolean;
 }>(), {
   compactFolders: true,
   defaultExpanded: true,
@@ -25,17 +42,36 @@ const props = withDefaults(defineProps<{
   stateKey: undefined,
   dataReady: true,
   revealSelection: false,
+  multiple: true,
+  selectionGroup: undefined,
+  selectionVisible: true,
 });
-const selected = defineModel<string>();
+// The default model is the previewed file, independent of the selected rows.
+const currentFile = defineModel<string>();
 const emit = defineEmits<{
   select: [item: T];
+  selectionChange: [paths: readonly string[]];
   activate: [item: T];
   activateDirectory: [path: string];
-  contextmenu: [event: MouseEvent, item: T];
-  directoryContextmenu: [event: MouseEvent, path: string];
+  contextmenu: [event: MouseEvent, item: T, selection: readonly FileTreeSelectionEntry[]];
+  directoryContextmenu: [
+    event: MouseEvent,
+    path: string,
+    selection: readonly FileTreeSelectionEntry[],
+  ];
 }>();
 const disabled = computed(() => new Set(props.disabledPaths));
 const tree = useTemplateRef<HTMLElement>('tree');
+const group = props.selectionGroup ?? '';
+const sharedSelection = props.selectionGroup === undefined
+  ? undefined
+  : inject(fileTreeSelectionScopeKey);
+if (props.selectionGroup !== undefined && !sharedSelection) {
+  throw new Error('A selection group requires a FileTree selection scope.');
+}
+const selection = sharedSelection ?? createFileTreeSelection([group]);
+const keyFor = (path: string) => fileTreeSelectionKey(group, path);
+onBeforeUnmount(() => selection.removeGroup(group));
 
 function isDisabled(path: string) {
   return disabled.value.has(path)
@@ -45,21 +81,31 @@ function isDisabled(path: string) {
 type TreeNode = FileTreeNode<T>;
 const root = computed(() => buildFileTree(props.items));
 
-const folderPaths = computed(() => {
-  const paths: string[] = [];
+const orderedNodes = computed(() => {
+  const nodes: TreeNode[] = [];
 
   function visit(children: Map<string, TreeNode>) {
-    for (const node of children.values()) {
-      if (node.children.size) {
-        paths.push(node.path);
-        visit(node.children);
-      }
+    for (const node of sortedFileTreeNodes(children)) {
+      nodes.push(node);
+      visit(node.children);
     }
   }
 
   visit(root.value);
-  return paths;
+  return nodes;
 });
+const folderPaths = computed(() => orderedNodes.value.filter((node) => node.children.size)
+  .map((node) => node.path));
+const allPaths = computed(() => orderedNodes.value.map((node) => node.path));
+const selectedPaths = computed(() => allPaths.value.filter((path) =>
+  selection.state.selectedKeys.has(keyFor(path)),
+));
+watch(selectedPaths, (paths, previous) => {
+  if (paths.length !== previous.length || paths.some((path) => !previous.includes(path))) {
+    emit('selectionChange', paths);
+  }
+});
+defineExpose({ selectedPaths });
 const { isExpanded, setExpanded } = useExpansionState(
   () => props.stateKey,
   folderPaths,
@@ -67,7 +113,18 @@ const { isExpanded, setExpanded } = useExpansionState(
   () => props.defaultExpanded,
 );
 
-watch([() => selected.value, () => props.revealSelection], async ([path, reveal]) => {
+watch(currentFile, (path) => {
+  if (sharedSelection || path === undefined) {
+    return;
+  }
+  const key = keyFor(path);
+  // A click updates selection before emitting the preview model. Its echo must not reset a range.
+  if (key !== selection.state.current) {
+    selection.state.replace(key);
+  }
+}, { immediate: true });
+
+watch([currentFile, () => props.revealSelection], async ([path, reveal]) => {
   if (!path || !reveal) {
     return;
   }
@@ -78,8 +135,8 @@ watch([() => selected.value, () => props.revealSelection], async ([path, reveal]
     setExpanded(ancestors, true);
   }
   await nextTick();
-  tree.value?.querySelector<HTMLElement>('[aria-selected="true"]')
-    ?.scrollIntoView({ block: 'nearest', inline: 'nearest' });
+  const entry = tree.value?.querySelector<HTMLElement>('[data-current="true"]');
+  entry?.scrollIntoView({ block: 'nearest', inline: 'nearest' });
 }, { immediate: true, flush: 'post' });
 
 const rows = computed(() => {
@@ -122,18 +179,48 @@ const rows = computed(() => {
   append(root.value, 0);
   return result;
 });
+const tabStopPath = computed(() => {
+  const available = rows.value.filter((row) => !isDisabled(row.node.path));
+  return available.find((row) => selection.state.current === keyFor(row.node.path))?.node.path
+    ?? available[0]?.node.path;
+});
 
-function select(index: number) {
+watchEffect(() => {
+  const visible = props.selectionVisible
+    ? rows.value.filter((row) => !isDisabled(row.node.path)).map((row) => row.node.path)
+    : [];
+  selection.updateGroup(group, visible, allPaths.value, props.dataReady);
+});
+
+function preview(node: TreeNode) {
+  if (!node.children.size && node.item) {
+    currentFile.value = node.path;
+    emit('select', node.item);
+  }
+}
+
+function select(event: MouseEvent | KeyboardEvent, index: number) {
   const row = rows.value[index];
   const node = row.node;
   if (isDisabled(node.path)) {
     return;
   }
-  if (node.children.size) {
+  if (!props.multiple && node.children.size) {
     setExpanded(row.paths, !row.expanded);
-  } else if (node.item) {
-    selected.value = node.path;
-    emit('select', node.item);
+    return;
+  }
+  selection.state.select(keyFor(node.path), selection.visibleKeys.value, {
+    additive: props.multiple && (event.ctrlKey || event.metaKey),
+    range: props.multiple && event.shiftKey,
+  });
+  preview(node);
+}
+
+function toggle(event: MouseEvent, index: number) {
+  const row = rows.value[index];
+  if (!isDisabled(row.node.path)) {
+    setExpanded(row.paths, !row.expanded);
+    (event.currentTarget as HTMLElement).parentElement!.focus({ preventScroll: true });
   }
 }
 
@@ -143,15 +230,18 @@ function contextMenu(event: MouseEvent, node: TreeNode) {
     event.stopPropagation();
     return;
   }
+  selection.state.openContext(keyFor(node.path));
+  preview(node);
   if (node.children.size) {
-    emit('directoryContextmenu', event, node.path);
+    emit('directoryContextmenu', event, node.path, selection.selectedEntries.value);
   } else if (node.item) {
-    emit('contextmenu', event, node.item);
+    emit('contextmenu', event, node.item, selection.selectedEntries.value);
   }
 }
 
 function activate(event: MouseEvent, node: TreeNode) {
-  if (event.button !== 0 || isDisabled(node.path)) {
+  if (event.button !== 0 || event.ctrlKey || event.metaKey || event.shiftKey
+    || isDisabled(node.path)) {
     return;
   }
   if (node.children.size) {
@@ -162,11 +252,25 @@ function activate(event: MouseEvent, node: TreeNode) {
 }
 
 function navigate(event: KeyboardEvent, index: number) {
-  const tree = (event.currentTarget as HTMLElement).parentElement!;
-  const buttons = tree.querySelectorAll<HTMLButtonElement>('.entry');
+  // Action buttons have their own keyboard behavior.
+  if (event.target !== event.currentTarget) {
+    return;
+  }
+  const entries = tree.value!.querySelectorAll<HTMLElement>('.tree-row');
   const row = rows.value[index];
   const node = row.node;
   if (isDisabled(node.path)) {
+    return;
+  }
+  const additive = event.ctrlKey || event.metaKey;
+  if (props.multiple && additive && event.key.toLowerCase() === 'a') {
+    event.preventDefault();
+    selection.state.selectAll(selection.visibleKeys.value);
+    return;
+  }
+  if (event.key === ' ' || event.key === 'Enter') {
+    event.preventDefault();
+    select(event, index);
     return;
   }
   let target = index;
@@ -207,10 +311,16 @@ function navigate(event: KeyboardEvent, index: number) {
   }
   event.preventDefault();
   const direction = ['ArrowUp', 'ArrowLeft', 'End'].includes(event.key) ? -1 : 1;
-  while (buttons[target]?.disabled) {
+  while (rows.value[target] && isDisabled(rows.value[target].node.path)) {
     target += direction;
   }
-  buttons[target]?.focus();
+  const targetRow = rows.value[target];
+  if (targetRow && target !== index) {
+    entries[target]?.focus();
+    if ((!additive || event.shiftKey) && (props.multiple || !targetRow.node.children.size)) {
+      select(event, target);
+    }
+  }
 }
 </script>
 
@@ -219,47 +329,64 @@ function navigate(event: KeyboardEvent, index: number) {
     ref="tree"
     class="file-tree"
     role="tree"
+    :aria-multiselectable="multiple"
   >
     <div
       v-for="({ node, name, depth, expanded }, index) in rows"
       :key="node.path"
       class="tree-row"
-      :class="{ selected: selected === node.path, disabled: isDisabled(node.path) }"
+      :class="{
+        selected: selection.state.selectedKeys.has(keyFor(node.path)),
+        disabled: isDisabled(node.path),
+      }"
       :style="{ paddingLeft: `${0.5 + depth}em` }"
+      role="treeitem"
+      :tabindex="node.path === tabStopPath ? 0 : -1"
+      :aria-disabled="isDisabled(node.path) || undefined"
+      :aria-level="depth + 1"
+      :aria-expanded="node.children.size ? expanded : undefined"
+      :aria-selected="selection.state.selectedKeys.has(keyFor(node.path))"
+      :data-current="selection.state.current === keyFor(node.path)"
+      :title="node.path"
+      @click="select($event, index)"
+      @dblclick="activate($event, node)"
       @keydown="navigate($event, index)"
       @contextmenu="contextMenu($event, node)"
     >
       <button
-        class="entry"
+        v-if="node.children.size"
+        class="prefix disclosure"
         type="button"
-        role="treeitem"
+        tabindex="-1"
         :disabled="isDisabled(node.path)"
-        :aria-disabled="isDisabled(node.path) || undefined"
-        :aria-level="depth + 1"
-        :aria-expanded="node.children.size ? expanded : undefined"
-        :aria-selected="!node.children.size ? selected === node.path : undefined"
-        :title="node.path"
-        @click="select(index)"
-        @dblclick="activate($event, node)"
+        :aria-label="`${expanded ? 'Collapse' : 'Expand'} ${node.path}`"
+        @click.stop="toggle($event, index)"
+        @dblclick.stop
       >
-        <span class="prefix">
-          <tree-disclosure
-            v-if="node.children.size"
-            :expanded="expanded"
-          />
-          <slot
-            v-else
-            name="prefix"
-            :item="node.item!"
-          />
-        </span>
-        <span class="name">{{ name }}</span>
+        <tree-disclosure :expanded="expanded" />
       </button>
-      <slot
-        v-if="node.item"
-        name="actions"
-        :item="node.item"
-      />
+      <span
+        v-else
+        class="prefix"
+      >
+        <slot
+          name="prefix"
+          :item="node.item!"
+        />
+      </span>
+      <span class="name">{{ name }}</span>
+      <span
+        v-if="node.item && $slots.actions"
+        class="actions"
+        @click.stop
+        @dblclick.stop
+        @contextmenu.stop.prevent
+      >
+        <slot
+          name="actions"
+          :item="node.item"
+        />
+      </span>
     </div>
   </div>
 </template>
@@ -269,31 +396,29 @@ function navigate(event: KeyboardEvent, index: number) {
 .tree-row {
   display: flex;
   align-items: center;
+  gap: 0.5em;
   min-height: 1.6em;
   padding-right: 0.5em;
+  cursor: pointer;
+  user-select: none;
   &:hover:not(.disabled) { background: var(--hover); }
   &.selected { background: var(--selected); }
   &.disabled { opacity: 0.5; cursor: wait; }
+  &:focus-visible { outline: 1px solid var(--accent); outline-offset: -1px; }
 }
-.entry {
+.disclosure {
   appearance: none;
   border: 0;
   padding: 0;
   background: transparent;
   font: inherit;
   cursor: pointer;
-  display: flex;
-  align-items: center;
-  gap: 0.5em;
-  flex: 1;
-  min-width: 0;
-  height: 1.6em;
   color: inherit;
-  text-align: left;
   &:focus-visible { outline: 1px solid var(--accent); outline-offset: -1px; }
   &:disabled { cursor: wait; }
 }
-.name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.name { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.actions { display: flex; flex-shrink: 0; }
 .prefix {
   display: flex;
   align-items: center;

@@ -11,6 +11,7 @@ import {
   fileDiffPath,
   gitCommitPath,
   gitIndexPath,
+  gitIndexPathsPath,
   gitIndexAllPath,
   GitIndexAction,
   worktreeStatusPath,
@@ -29,6 +30,7 @@ import { GitSubmoduleDirtyError } from './git-submodule-dirty-error.ts';
 import {
   changeAllIndex,
   changeIndex,
+  changeIndexPaths,
   commitWorktree,
   readFileDiff,
   readWorktreeStatus,
@@ -52,7 +54,12 @@ export async function handleGitRequest(
     commitFilePath,
     repositoryOverviewPath,
   ];
-  const writeRoutes = [gitIndexPath, gitIndexAllPath, gitCommitPath];
+  const writeRoutes = [
+    gitIndexPath,
+    gitIndexPathsPath,
+    gitIndexAllPath,
+    gitCommitPath,
+  ];
   const isRead = readRoutes.includes(url.pathname);
   if (!isRead && !writeRoutes.includes(url.pathname)) {
     response.writeHead(404).end();
@@ -151,6 +158,15 @@ export async function handleGitRequest(
         return;
       }
       sendJson(response, 200, await changeIndex(repoPath, body.path, body.action));
+      break;
+    case gitIndexPathsPath:
+      if (!Array.isArray(body.paths) || !body.paths.length
+        || !body.paths.every((path) => typeof path === 'string' && path.length > 0)
+        || (body.action !== GitIndexAction.stage && body.action !== GitIndexAction.unstage)) {
+        sendJson(response, 400, { error: 'paths and a valid index action are required.' });
+        return;
+      }
+      sendJson(response, 200, await changeIndexPaths(repoPath, body.paths, body.action));
       break;
     case gitIndexAllPath:
       if ((body.directory !== undefined

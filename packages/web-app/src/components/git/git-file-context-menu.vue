@@ -2,8 +2,7 @@
 import { GitIndexAction } from '@glink/protocol/git';
 import { nextTick, onMounted, onUnmounted, ref, useTemplateRef, watch } from 'vue';
 const props = defineProps<{
-  path: string;
-  repoPath: string;
+  paths: ReadonlyArray<{ path: string; repoPath: string }>;
   x: number;
   y: number;
   indexAction?: GitIndexAction;
@@ -35,7 +34,7 @@ onMounted(() => {
   });
 });
 watch(
-  () => [props.x, props.y, props.path],
+  () => [props.x, props.y, props.paths],
   () => {
     error.value = '';
     void place();
@@ -44,16 +43,16 @@ watch(
 onUnmounted(() => events.abort());
 
 async function copy(absolute: boolean) {
-  const path = absolute
-    ? `${props.repoPath.replaceAll('\\', '/').replace(/\/$/, '')}/${props.path}`
-    : props.path;
+  const text = props.paths.map(({ path, repoPath }) => absolute
+    ? `${repoPath.replaceAll('\\', '/').replace(/\/$/, '')}/${path}`
+    : path).join('\n');
   try {
     if (navigator.clipboard) {
-      await navigator.clipboard.writeText(path);
+      await navigator.clipboard.writeText(text);
     } else {
       // LAN HTTP origins have no Clipboard API; keep copying available from the menu gesture.
       const input = document.createElement('textarea');
-      input.value = path;
+      input.value = text;
       input.readOnly = true;
       input.style.position = 'fixed';
       input.style.opacity = '0';

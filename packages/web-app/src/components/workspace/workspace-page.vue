@@ -19,9 +19,14 @@ import type {
 } from '@glink/protocol/workspace';
 import { WorkspaceConnectionKind } from '@glink/protocol/workspace';
 import { appKey } from '../../app-context';
-import { GitIndexScope, type GitIndexTarget } from '../../git/git-index-target';
+import { gitIndexPendingPaths, GitIndexScope } from '../../git/git-index-target';
+import type {
+  PendingWorkspaceIndex,
+  WorkspaceIndexTarget,
+} from '../../workspace/workspace-index-target';
 import { nextChangeAfterIndex, orderGitChanges } from '../../git/git-index-selection';
 import { workspaceChangeGroups } from '../../workspace/workspace-change-groups';
+import { createFileTreeSelection, fileTreeSelectionKey } from '../file-tree-selection';
 import GitFileDiff from '../git/git-file-diff.vue';
 import SplitPane from '../split-pane.vue';
 import WorkspaceOutline from './workspace-outline.vue';
@@ -73,14 +78,25 @@ const visibleHistoryErrors = computed(() =>
 );
 const expanded = ref(false);
 const busy = ref(false);
-// An absent path represents a pending batch for the whole project.
-const pendingIndex = ref<{ projectId: string; path?: string }>();
+const pendingIndex = ref<readonly PendingWorkspaceIndex[]>([]);
 const loading = ref(false);
 const refreshKey = ref(0);
 const historyRefreshKey = ref(0);
 const error = ref('');
 const diffError = ref('');
 const selection = ref<{ projectId: string; path: string; staged: boolean }>();
+const selectionGroupIds = computed(() =>
+  projectIds.value.filter((id) => selectedProjectSet.value.has(id)),
+);
+const unstagedSelection = createFileTreeSelection(selectionGroupIds);
+const stagedSelection = createFileTreeSelection(selectionGroupIds);
+let fileSelectionVersion = 0;
+watch([
+  () => unstagedSelection.state.selectedKeys,
+  () => unstagedSelection.state.current,
+  () => stagedSelection.state.selectedKeys,
+  () => stagedSelection.state.current,
+], () => fileSelectionVersion++, { flush: 'sync' });
 const diff = ref<FileDiffResponse>();
 const diffTitle = computed(() => {
   const project = workspace.value.projects.find((item) => item.id === selection.value?.projectId);
@@ -214,33 +230,40 @@ function applyStatuses(updates: WorkspaceProjectStatus[], metadataFresh = true) 
   }
 }
 
-async function refreshRelatedStatuses(state: WorkspaceChangesSnapshot, metadataStale: boolean) {
-  const projectId = state.projectId;
-  const project = workspace.value.projects.find((project) => project.id === projectId)!;
-  const registeredPaths = new Set(workspace.value.connections
-    .filter((connection) => connection.kind === WorkspaceConnectionKind.submodule
-      && connection.from === projectId)
-    .map((connection) => workspace.value.projects.find((child) => child.id === connection.to)!
-      .worktreePath.slice(project.worktreePath.length + 1)));
-  if (state.submodulePaths && (registeredPaths.size !== state.submodulePaths.length
-    || state.submodulePaths.some((path) => !registeredPaths.has(path)))) {
-    structureDirty = true;
-  }
-  const related = new Set([projectId]);
-  let count: number;
-  do {
-    count = related.size;
-    for (const connection of workspace.value.connections) {
-      if (connection.kind === WorkspaceConnectionKind.submodule && related.has(connection.to)) {
-        related.add(connection.from);
-      }
+async function refreshRelatedStatuses(updates: readonly WorkspaceChangesSnapshot[]) {
+  for (const state of updates) {
+    if (!staleMetadataIds.has(state.projectId)) {
+      pendingStatusIds.delete(state.projectId);
+    } else {
+      pendingStatusIds.add(state.projectId);
     }
-  } while (related.size !== count);
-  for (const id of related) {
-    pendingStatusIds.add(id);
   }
-  if (!metadataStale) {
-    pendingStatusIds.delete(projectId);
+  for (const state of updates) {
+    const projectId = state.projectId;
+    const project = workspace.value.projects.find((project) => project.id === projectId)!;
+    const registeredPaths = new Set(workspace.value.connections
+      .filter((connection) => connection.kind === WorkspaceConnectionKind.submodule
+        && connection.from === projectId)
+      .map((connection) => workspace.value.projects.find((child) => child.id === connection.to)!
+        .worktreePath.slice(project.worktreePath.length + 1)));
+    if (state.submodulePaths && (registeredPaths.size !== state.submodulePaths.length
+      || state.submodulePaths.some((path) => !registeredPaths.has(path)))) {
+      structureDirty = true;
+    }
+    const related = new Set([projectId]);
+    let count: number;
+    do {
+      count = related.size;
+      for (const connection of workspace.value.connections) {
+        if (connection.kind === WorkspaceConnectionKind.submodule && related.has(connection.to)) {
+          related.add(connection.from);
+        }
+      }
+    } while (related.size !== count);
+    related.delete(projectId);
+    for (const id of related) {
+      pendingStatusIds.add(id);
+    }
   }
   if (!pendingStatusIds.size && !structureDirty) {
     return;
@@ -282,7 +305,8 @@ async function refreshRelatedStatuses(state: WorkspaceChangesSnapshot, metadataS
     }
   } catch (cause: unknown) {
     if (!controller.signal.aborted) {
-      error.value = `关联项目状态刷新失败：${String(cause)}`;
+      error.value = [error.value, `关联项目状态刷新失败：${String(cause)}`]
+        .filter(Boolean).join('\n');
     }
   }
 }
@@ -319,8 +343,8 @@ async function refresh() {
   }
 }
 
-const diffPending = computed(() => busy.value && (!pendingIndex.value
-  || pendingIndex.value.projectId === selection.value?.projectId));
+const diffPending = computed(() => busy.value && (!pendingIndex.value.length
+  || pendingIndex.value.some((entry) => entry.projectId === selection.value?.projectId)));
 
 watch([selection, refreshKey, diffPending], async ([selected], [previous]) => {
   if (
@@ -377,33 +401,60 @@ function orderedChanges(staged: boolean) {
   })));
 }
 
-async function index(projectId: string, staged: boolean, target: GitIndexTarget) {
-  if (busy.value || loading.value) {
+async function index(staged: boolean, targets: readonly WorkspaceIndexTarget[]) {
+  if (busy.value || loading.value || !targets.length) {
     return;
   }
   const before = orderedChanges(staged);
   const selectionBefore = selection.value;
+  const selectionVersionBefore = fileSelectionVersion;
   const scopeBefore = selectedProjectIds.value;
-  const project = workspace.value.projects.find((item) => item.id === projectId)!;
   busy.value = true;
   relatedStatusController?.abort();
-  pendingIndex.value = {
-    projectId,
-    path: target.scope === GitIndexScope.worktree ? undefined : target.path,
-  };
+  pendingIndex.value = targets.map((target) => ({
+    projectId: target.projectId,
+    paths: gitIndexPendingPaths(target),
+  }));
   error.value = '';
   result.value = undefined;
   try {
     const action = staged ? GitIndexAction.unstage : GitIndexAction.stage;
-    const state = target.scope === GitIndexScope.file
-      ? await service.changeIndex(workspace.value.id, projectId, target.path, action)
-      : await service.changeAllIndex(
-        workspace.value.id,
-        projectId,
-        action,
-        target.scope === GitIndexScope.directory ? target.path : undefined,
-      );
-    if (!focusController.signal.aborted) {
+    const outcomes = await Promise.allSettled(targets.map(async (target) => {
+      switch (target.scope) {
+      case GitIndexScope.file:
+        return service.changeIndex(workspace.value.id, target.projectId, target.path, action);
+      case GitIndexScope.paths:
+        return service.changeIndexPaths(workspace.value.id, target.projectId, target.paths, action);
+      default:
+        return service.changeAllIndex(
+          workspace.value.id,
+          target.projectId,
+          action,
+          target.scope === GitIndexScope.directory ? target.path : undefined,
+        );
+      }
+    }));
+    if (focusController.signal.aborted) {
+      return;
+    }
+    const completed: WorkspaceChangesSnapshot[] = [];
+    const failedIds: string[] = [];
+    const failures: string[] = [];
+    outcomes.forEach((outcome, position) => {
+      if (outcome.status === 'fulfilled') {
+        completed.push(outcome.value);
+      } else {
+        const projectId = targets[position].projectId;
+        const project = workspace.value.projects.find((item) => item.id === projectId)!;
+        failedIds.push(projectId);
+        failures.push(`${project.name}: ${String(outcome.reason)}`);
+      }
+    });
+    const advance = !failures.length && selection.value === selectionBefore
+      && fileSelectionVersion === selectionVersionBefore
+      && selectedProjectIds.value === scopeBefore;
+    let headChanged = false;
+    const updates = completed.map((state) => {
       const previous = statuses.value.find((status) => status.projectId === state.projectId);
       const metadataStale = !previous || !!previous.error || staleMetadataIds.has(state.projectId)
         || previous.head !== state.head
@@ -414,55 +465,63 @@ async function index(projectId: string, staged: boolean, target: GitIndexTarget)
       const baseAmendBlockedReason = metadataStale
         ? '等待有效的项目状态。'
         : previous.baseAmendBlockedReason;
-      const advance = selection.value === selectionBefore
-        && selectedProjectIds.value === scopeBefore;
-      applyStatuses([{
+      headChanged ||= previous?.head !== state.head;
+      return {
         ...state,
         headMessage: metadataStale ? undefined : previous.headMessage,
         aheadCount: metadataStale ? undefined : previous.aheadCount,
         baseAmendBlockedReason,
         amendBlockedReason: baseAmendBlockedReason ?? state.amendBlockedReason,
         submodulePaths: state.submodulePaths ?? previous?.submodulePaths,
-      }], false);
-      if (advance) {
-        const next = nextChangeAfterIndex(before, orderedChanges(staged), {
-          ...target,
-          worktreePath: project.worktreePath,
-          action,
-        });
-        const nextProject = next && workspace.value.projects.find(
-          (item) => item.worktreePath === next.worktreePath,
-        )!;
-        selection.value = next && nextProject
-          ? { projectId: nextProject.id, path: next.file.path, staged }
-          : undefined;
-      }
-      if (previous?.head !== state.head) {
-        historyRefreshKey.value++;
-      }
-      void refreshRelatedStatuses(state, metadataStale);
+      };
+    });
+    applyStatuses(updates, false);
+    if (advance) {
+      const next = nextChangeAfterIndex(before, orderedChanges(staged), targets.map((target) => ({
+        ...target,
+        worktreePath: workspace.value.projects.find((item) => item.id === target.projectId)!
+          .worktreePath,
+        action,
+      })));
+      const nextProject = next && workspace.value.projects.find(
+        (item) => item.worktreePath === next.worktreePath,
+      )!;
+      selection.value = next && nextProject
+        ? { projectId: nextProject.id, path: next.file.path, staged }
+        : undefined;
+      const sourceSelection = staged ? stagedSelection : unstagedSelection;
+      sourceSelection.state.replace(next && nextProject
+        ? fileTreeSelectionKey(nextProject.id, next.file.path)
+        : undefined);
     }
-  } catch (cause: unknown) {
-    error.value = String(cause);
-    try {
-      applyStatuses(await service.status(workspace.value.id, {
-        projectIds: [projectId],
-        signal: focusController.signal,
-      }));
-    } catch (refreshError: unknown) {
-      if (!focusController.signal.aborted) {
-        applyStatuses([{
-          projectId,
-          staged: [],
-          unstaged: [],
-          indexFingerprint: 'unavailable',
-          error: String(refreshError),
-        }]);
-        error.value += `\n目标项目状态刷新失败：${String(refreshError)}`;
+    if (headChanged) {
+      historyRefreshKey.value++;
+    }
+    if (failedIds.length) {
+      error.value = failures.join('\n');
+      try {
+        applyStatuses(await service.status(workspace.value.id, {
+          projectIds: failedIds,
+          signal: focusController.signal,
+        }));
+      } catch (refreshError: unknown) {
+        if (!focusController.signal.aborted) {
+          applyStatuses(failedIds.map((projectId) => ({
+            projectId,
+            staged: [],
+            unstaged: [],
+            indexFingerprint: 'unavailable',
+            error: String(refreshError),
+          })));
+          error.value += `\n目标项目状态刷新失败：${String(refreshError)}`;
+        }
       }
+    }
+    if (!focusController.signal.aborted) {
+      void refreshRelatedStatuses(completed);
     }
   } finally {
-    pendingIndex.value = undefined;
+    pendingIndex.value = [];
     busy.value = false;
   }
 }
@@ -601,11 +660,12 @@ onUnmounted(() => {
                 :statuses="statuses"
                 :staged="false"
                 :selected="selection"
+                :selection="unstagedSelection"
                 :pending-index="pendingIndex"
                 :busy="busy"
                 :loading="loading"
                 @select="(projectId, file) => selectFile(projectId, file, false)"
-                @index="(projectId, target) => index(projectId, false, target)"
+                @index="index(false, $event)"
               />
             </template><template #second>
               <workspace-change-list
@@ -614,11 +674,12 @@ onUnmounted(() => {
                 :statuses="statuses"
                 staged
                 :selected="selection"
+                :selection="stagedSelection"
                 :pending-index="pendingIndex"
                 :busy="busy"
                 :loading="loading"
                 @select="(projectId, file) => selectFile(projectId, file, true)"
-                @index="(projectId, target) => index(projectId, true, target)"
+                @index="index(true, $event)"
               />
             </template>
           </split-pane>

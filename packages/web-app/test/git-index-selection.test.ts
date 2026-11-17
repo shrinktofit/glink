@@ -29,12 +29,12 @@ describe('Selection after staging or unstaging in file-tree order', () => {
       worktreePath,
       files: files.filter((file) => file.path !== 'm/c.txt'),
     }]);
-    const next = nextChangeAfterIndex(before, after, {
+    const next = nextChangeAfterIndex(before, after, [{
       worktreePath,
       action: GitIndexAction.stage,
       scope: GitIndexScope.file,
       path: 'm/c.txt',
-    });
+    }]);
     expect(next?.file.path).toBe('z/a.txt');
   });
 
@@ -46,12 +46,12 @@ describe('Selection after staging or unstaging in file-tree order', () => {
       const fresh = files.filter((file) => !file.path.startsWith('m/'))
         .map((file) => ({ ...file, type: GitDiffType.deleted }));
       const after = orderGitChanges([{ worktreePath, files: fresh }]);
-      const next = nextChangeAfterIndex(before, after, {
+      const next = nextChangeAfterIndex(before, after, [{
         worktreePath,
         action,
         scope: GitIndexScope.directory,
         path: 'm',
-      });
+      }]);
       expect(next?.file).toEqual({ path: 'z/a.txt', type: GitDiffType.deleted });
     },
   );
@@ -64,12 +64,12 @@ describe('Selection after staging or unstaging in file-tree order', () => {
       worktreePath,
       files: files.filter((file) => file.path !== 'z-root.txt'),
     }]);
-    expect(nextChangeAfterIndex(before, after, {
+    expect(nextChangeAfterIndex(before, after, [{
       worktreePath,
       action: GitIndexAction.stage,
       scope: GitIndexScope.file,
       path: 'z-root.txt',
-    })?.file.path).toBe('m/b.txt');
+    }])?.file.path).toBe('m/b.txt');
   });
 
   it('continues across worktrees without confusing identical relative paths', () => {
@@ -79,11 +79,11 @@ describe('Selection after staging or unstaging in file-tree order', () => {
     const secondary = { worktreePath: '/secondary', files: [change('same.txt')] };
     const before = orderGitChanges([primary, secondary]);
     const after = orderGitChanges([secondary]);
-    expect(nextChangeAfterIndex(before, after, {
+    expect(nextChangeAfterIndex(before, after, [{
       worktreePath,
       action: GitIndexAction.unstage,
       scope: GitIndexScope.worktree,
-    })).toEqual({ worktreePath: '/secondary', file: change('same.txt') });
+    }])).toEqual({ worktreePath: '/secondary', file: change('same.txt') });
   });
 
   it('keeps blocked dirty submodule pointers as eligible next source rows', () => {
@@ -95,12 +95,12 @@ describe('Selection after staging or unstaging in file-tree order', () => {
       files: [change('m/b.txt'), blocked, change('z.txt')],
     }]);
     const after = orderGitChanges([{ worktreePath, files: [blocked, change('z.txt')] }]);
-    expect(nextChangeAfterIndex(before, after, {
+    expect(nextChangeAfterIndex(before, after, [{
       worktreePath,
       action: GitIndexAction.stage,
       scope: GitIndexScope.directory,
       path: 'm',
-    })?.file.path).toBe('m/c.txt');
+    }])?.file.path).toBe('m/c.txt');
   });
 
   it('advances even when newer edits leave the operated file in the source list', () => {
@@ -108,12 +108,12 @@ describe('Selection after staging or unstaging in file-tree order', () => {
     /// @expect Continue after that file and only revisit it after a full wrap.
     const before = orderGitChanges([{ worktreePath, files }]);
     const after = orderGitChanges([{ worktreePath, files: files.map((file) => ({ ...file })) }]);
-    expect(nextChangeAfterIndex(before, after, {
+    expect(nextChangeAfterIndex(before, after, [{
       worktreePath,
       action: GitIndexAction.stage,
       scope: GitIndexScope.file,
       path: 'm/b.txt',
-    })?.file.path).toBe('m/c.txt');
+    }])?.file.path).toBe('m/c.txt');
   });
 
   it('selects newly appeared files when no original rows survive', () => {
@@ -121,21 +121,47 @@ describe('Selection after staging or unstaging in file-tree order', () => {
     /// @expect A nonempty source region still has a selection, starting from its first new row.
     const before = orderGitChanges([{ worktreePath, files }]);
     const after = orderGitChanges([{ worktreePath, files: [change('new.txt')] }]);
-    expect(nextChangeAfterIndex(before, after, {
+    expect(nextChangeAfterIndex(before, after, [{
       worktreePath,
       action: GitIndexAction.stage,
       scope: GitIndexScope.worktree,
-    })?.file.path).toBe('new.txt');
+    }])?.file.path).toBe('new.txt');
   });
 
   it('clears selection when the source region becomes empty', () => {
     /// @case All files leave the source region after the operation.
     /// @expect No file from the destination region is selected as a replacement.
     const before = orderGitChanges([{ worktreePath, files }]);
-    expect(nextChangeAfterIndex(before, [], {
+    expect(nextChangeAfterIndex(before, [], [{
       worktreePath,
       action: GitIndexAction.unstage,
       scope: GitIndexScope.worktree,
-    })).toBeUndefined();
+    }])).toBeUndefined();
+  });
+
+  it('continues after the last affected file across a multi-worktree batch', () => {
+    /// @case Disjoint selected files span two projects with other files between them.
+    /// @expect Advance only once, after the last affected row in the complete source order.
+    const before = orderGitChanges([
+      { worktreePath, files },
+      { worktreePath: '/secondary', files: [change('a.txt'), change('z.txt')] },
+    ]);
+    const after = before.filter((entry) => entry.worktreePath === worktreePath
+      ? entry.file.path !== 'm/b.txt'
+      : entry.file.path !== 'a.txt');
+    expect(nextChangeAfterIndex(before, after, [
+      {
+        worktreePath,
+        action: GitIndexAction.stage,
+        scope: GitIndexScope.paths,
+        paths: ['m/b.txt'],
+      },
+      {
+        worktreePath: '/secondary',
+        action: GitIndexAction.stage,
+        scope: GitIndexScope.paths,
+        paths: ['a.txt'],
+      },
+    ])).toEqual({ worktreePath: '/secondary', file: change('z.txt') });
   });
 });

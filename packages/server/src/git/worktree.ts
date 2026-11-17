@@ -183,21 +183,17 @@ export class GitIndexTransaction {
   }
 
   async changeAll(action: GitIndexAction, directory?: string): Promise<ChangesSnapshot> {
-    const state = action === GitIndexAction.stage
-      ? await readStatusEntries(this.repoPath, directory === undefined ? undefined : [directory])
-      : await readIndexChanges(this.repoPath);
-    const selected = state.entries.flatMap((entry) => {
-      const file = action === GitIndexAction.stage ? entry.unstaged : entry.staged;
-      if (!file || (directory !== undefined && !file.path.startsWith(`${directory}/`))
-        || (action === GitIndexAction.stage && file.stageBlockedReason)) {
-        return [];
-      }
-      return [{ entry, file }];
-    });
-    await this._write(selected.map(({ file }) => file), action, state.head);
-    return this.readChanges(selected.some(({ entry, file }) =>
-      this._changesSubmoduleMembership(entry, file, action),
-    ));
+    return this._changeBatch(action,
+      (file) => directory === undefined || file.path.startsWith(`${directory}/`),
+      directory === undefined ? undefined : [directory]);
+  }
+
+  changePaths(paths: readonly string[], action: GitIndexAction): Promise<ChangesSnapshot> {
+    if (paths.length === 1) {
+      return this.change(paths[0], action);
+    }
+    const selected = new Set(paths);
+    return this._changeBatch(action, (file) => selected.has(file.path));
   }
 
   async commit(input: GitCommitInput) {
@@ -217,6 +213,28 @@ export class GitIndexTransaction {
   private constructor(repoPath: string, indexPath: string) {
     this.repoPath = repoPath;
     this.indexPath = indexPath;
+  }
+
+  private async _changeBatch(
+    action: GitIndexAction,
+    includes: (file: GitFileChange) => boolean,
+    statusPaths?: readonly string[],
+  ) {
+    const state = action === GitIndexAction.stage
+      ? await readStatusEntries(this.repoPath, statusPaths)
+      : await readIndexChanges(this.repoPath);
+    const selected = state.entries.flatMap((entry) => {
+      const file = action === GitIndexAction.stage ? entry.unstaged : entry.staged;
+      if (!file || !includes(file)
+        || (action === GitIndexAction.stage && file.stageBlockedReason)) {
+        return [];
+      }
+      return [{ entry, file }];
+    });
+    await this._write(selected.map(({ file }) => file), action, state.head);
+    return this.readChanges(selected.some(({ entry, file }) =>
+      this._changesSubmoduleMembership(entry, file, action),
+    ));
   }
 
   private _changesSubmoduleMembership(
@@ -252,6 +270,14 @@ export function changeIndex(repoPath: string, path: string, action: GitIndexActi
 
 export function changeAllIndex(repoPath: string, action: GitIndexAction, directory?: string) {
   return GitIndexTransaction.run(repoPath, (index) => index.changeAll(action, directory));
+}
+
+export function changeIndexPaths(
+  repoPath: string,
+  paths: readonly string[],
+  action: GitIndexAction,
+) {
+  return GitIndexTransaction.run(repoPath, (index) => index.changePaths(paths, action));
 }
 
 export function commitWorktree(repoPath: string, input: GitCommitInput) {

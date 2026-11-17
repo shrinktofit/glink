@@ -14,6 +14,7 @@ import {
   fileDiffPath,
   gitCommitPath,
   gitIndexPath,
+  gitIndexPathsPath,
   worktreeStatusPath,
   repositoryOverviewPath,
   type FileDiffResponse,
@@ -217,6 +218,33 @@ describe('Worktree HTTP operations against real Git repositories', () => {
     await post(gitIndexPath, { path: 'renamed 文件.txt', action: 'unstage' });
     expect((await get<WorktreeStatus>(worktreeStatusPath)).staged).toEqual([]);
     expect(await readFile(join(repoPath, 'renamed 文件.txt'), 'utf8')).toBe('after rename\n');
+  });
+
+  it('batches selected paths without including other changes', async () => {
+    /// @case Stage and unstage a modified file and a new literal path, leaving another file alone.
+    /// @expect Both requests update only their selected paths and return the resulting snapshot.
+    await writeFile(join(repoPath, 'file.txt'), 'changed\n');
+    await writeFile(join(repoPath, 'new [1] 文件.txt'), 'new\n');
+    await writeFile(join(repoPath, 'keep.txt'), 'keep\n');
+    for (const action of ['stage', 'unstage']) {
+      const response = await fetch(`${origin}${gitIndexPathsPath}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          repoPath,
+          paths: ['file.txt', 'new [1] 文件.txt'],
+          action,
+        }),
+      });
+      expect(response.status).toBe(200);
+      const state = await response.json() as WorktreeStatus;
+      expect(state.staged.map((file) => file.path)).toEqual(
+        action === 'stage' ? ['file.txt', 'new [1] 文件.txt'] : [],
+      );
+      expect(state.unstaged.some((file) => file.path === 'keep.txt')).toBe(true);
+    }
+    expect(await readFile(join(repoPath, 'file.txt'), 'utf8')).toBe('changed\n');
+    expect(await readFile(join(repoPath, 'new [1] 文件.txt'), 'utf8')).toBe('new\n');
   });
 
   it('commits only the index and amends without absorbing unstaged edits', async () => {

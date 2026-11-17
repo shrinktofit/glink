@@ -55,6 +55,10 @@ export class GitRepoService {
     return this.gitService.changeAllIndex(this.repoPath, action, directory);
   }
 
+  changeIndexPaths(paths: readonly string[], action: GitIndexAction) {
+    return this.gitService.changeIndexPaths(this.repoPath, paths, action);
+  }
+
   commit(input: GitCommitInput) {
     return this.gitService.commit(this.repoPath, input);
   }

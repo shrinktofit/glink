@@ -12,12 +12,15 @@ import GitChangeList from './git-change-list.vue';
 import GitCommitForm from './git-commit-form.vue';
 import GitFileDiff from './git-file-diff.vue';
 import type { GitIndexTarget } from '../../git/git-index-target';
+import type { FileTreeSelectionScope } from '../file-tree-selection';
 
 defineProps<{
   status: WorktreeStatus;
   statusReady: boolean;
   selected?: { file: GitFileChange; staged: boolean };
-  pendingPath?: string;
+  unstagedSelection: FileTreeSelectionScope;
+  stagedSelection: FileTreeSelectionScope;
+  pendingPaths: readonly string[];
   diff?: FileDiffResponse;
   diffError?: string;
   error?: string;
@@ -54,7 +57,8 @@ const lists = ref(0.55);
             :ready="statusReady"
             :staged="false"
             :selected-path="selected && !selected.staged ? selected.file.path : undefined"
-            :pending-path="pendingPath"
+            :selection="unstagedSelection"
+            :pending-paths="pendingPaths"
             :busy="busy"
             :loading="loading"
             @select="emit('select', $event, false)"
@@ -67,7 +71,8 @@ const lists = ref(0.55);
             :ready="statusReady"
             staged
             :selected-path="selected?.staged ? selected.file.path : undefined"
-            :pending-path="pendingPath"
+            :selection="stagedSelection"
+            :pending-paths="pendingPaths"
             :busy="busy"
             :loading="loading"
             @select="emit('select', $event, true)"

@@ -4,6 +4,7 @@ export const commitGraphLimit = 500;
 export const worktreeStatusPath = '/api/git/status';
 export const fileDiffPath = '/api/git/diff';
 export const gitIndexPath = '/api/git/index';
+export const gitIndexPathsPath = '/api/git/index-paths';
 export const gitIndexAllPath = '/api/git/index-all';
 export const gitCommitPath = '/api/git/commit';
 export const commitDetailPath = '/api/git/commit-detail';

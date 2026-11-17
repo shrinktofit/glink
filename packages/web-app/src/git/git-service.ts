@@ -9,6 +9,7 @@ import {
   fileDiffPath,
   gitCommitPath,
   gitIndexPath,
+  gitIndexPathsPath,
   gitIndexAllPath,
   worktreeStatusPath,
   repositoryOverviewPath,
@@ -78,6 +79,14 @@ export class GitService {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ repoPath, action, directory }),
+    });
+  }
+
+  changeIndexPaths(repoPath: string, paths: readonly string[], action: GitIndexAction) {
+    return this._request<ChangesSnapshot>(gitIndexPathsPath, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ repoPath, paths, action }),
     });
   }
 

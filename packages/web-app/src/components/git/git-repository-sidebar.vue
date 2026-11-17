@@ -150,6 +150,7 @@ function selectReference(reference: GitReference) {
         <file-tree
           :items="branches"
           :compact-folders="false"
+          :multiple="false"
           aria-label="Branches"
           @select="selectReference"
         >
@@ -175,6 +176,7 @@ function selectReference(reference: GitReference) {
           <file-tree
             :items="remote.items"
             :compact-folders="false"
+            :multiple="false"
             :aria-label="`${remote.name} branches`"
             @select="selectReference"
           >
@@ -189,6 +191,7 @@ function selectReference(reference: GitReference) {
         <file-tree
           :items="tags"
           :compact-folders="false"
+          :multiple="false"
           aria-label="Tags"
           @select="selectReference"
         >

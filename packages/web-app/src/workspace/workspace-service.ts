@@ -190,6 +190,19 @@ export class WorkspaceService {
     });
   }
 
+  changeIndexPaths(
+    id: string,
+    projectId: string,
+    paths: readonly string[],
+    action: GitIndexAction,
+  ) {
+    return this._request<WorkspaceChangesSnapshot>(id, '/index-paths', 'POST', {
+      projectId,
+      paths,
+      action,
+    });
+  }
+
   commit(id: string, input: WorkspaceCommitInput) {
     return this._request<WorkspaceCommitResult>(id, '/commit', 'POST', input);
   }

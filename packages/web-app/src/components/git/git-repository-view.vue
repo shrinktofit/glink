@@ -3,14 +3,20 @@ import { computed, onBeforeUnmount, onMounted, provide, ref, watch, onWatcherCle
 import { GitIndexAction } from '@glink/protocol/git';
 import type {
   FileDiffResponse,
+  ChangesSnapshot,
   GitCommitInput,
   GitFileChange,
   RepositoryOverview,
   WorktreeStatus,
 } from '@glink/protocol/git';
 import { GitRepoService, gitRepoServiceKey } from '../../git/git-repo-service';
-import { GitIndexScope, type GitIndexTarget } from '../../git/git-index-target';
+import {
+  gitIndexPendingPaths,
+  GitIndexScope,
+  type GitIndexTarget,
+} from '../../git/git-index-target';
 import { nextChangeAfterIndex, orderGitChanges } from '../../git/git-index-selection';
+import { createFileTreeSelection, fileTreeSelectionKey } from '../file-tree-selection';
 import SplitPane from '../split-pane.vue';
 import GitHistoryView from './git-history-view.vue';
 import GitLocalChangesView from './git-local-changes-view.vue';
@@ -29,13 +35,22 @@ const status = ref<WorktreeStatus>({ staged: [], unstaged: [], indexFingerprint:
 const statusReady = ref(false);
 const loading = ref(true);
 const busy = ref(false);
-const pendingIndexPath = ref<string>();
+const pendingIndexPaths = ref<readonly string[]>([]);
 const error = ref('');
 const overviewError = ref('');
 const refreshKey = ref(0);
 const historyRefreshKey = ref(0);
 const selectedCommit = ref<string>();
 const selectedFile = ref<{ file: GitFileChange; staged: boolean }>();
+const unstagedSelection = createFileTreeSelection(['']);
+const stagedSelection = createFileTreeSelection(['']);
+let fileSelectionVersion = 0;
+watch([
+  () => unstagedSelection.state.selectedKeys,
+  () => unstagedSelection.state.current,
+  () => stagedSelection.state.selectedKeys,
+  () => stagedSelection.state.current,
+], () => fileSelectionVersion++, { flush: 'sync' });
 const diff = ref<FileDiffResponse>();
 const diffError = ref('');
 const summary = ref('');
@@ -132,19 +147,28 @@ async function changeIndex(target: GitIndexTarget, action: GitIndexAction) {
   }
   const staged = action === GitIndexAction.unstage;
   const selectionBefore = selectedFile.value;
+  const selectionVersionBefore = fileSelectionVersion;
   const before = orderGitChanges([{
     worktreePath: repo.repoPath,
     files: staged ? status.value.staged : status.value.unstaged,
   }]);
   busy.value = true;
   metadataController?.abort();
-  pendingIndexPath.value = target.scope === GitIndexScope.worktree ? undefined : target.path;
+  pendingIndexPaths.value = gitIndexPendingPaths(target) ?? before.map((entry) => entry.file.path);
   error.value = '';
   try {
-    const state = target.scope === GitIndexScope.file
-      ? await repo.changeIndex(target.path, action)
-      : await repo.changeAllIndex(action,
+    let state: ChangesSnapshot;
+    switch (target.scope) {
+    case GitIndexScope.file:
+      state = await repo.changeIndex(target.path, action);
+      break;
+    case GitIndexScope.paths:
+      state = await repo.changeIndexPaths(target.paths, action);
+      break;
+    default:
+      state = await repo.changeAllIndex(action,
         target.scope === GitIndexScope.directory ? target.path : undefined);
+    }
     if (lifecycle.signal.aborted) {
       return;
     }
@@ -152,19 +176,22 @@ async function changeIndex(target: GitIndexTarget, action: GitIndexAction) {
     metadataDirty ||= headChanged;
     overviewDirty ||= headChanged || !!state.submodulePaths
       || status.value.branch !== state.branch;
-    const advance = selectedFile.value === selectionBefore;
+    const advance = selectedFile.value === selectionBefore
+      && fileSelectionVersion === selectionVersionBefore;
     applyStatus({ ...state, headMessage: headChanged ? undefined : status.value.headMessage });
     if (advance) {
       const after = orderGitChanges([{
         worktreePath: repo.repoPath,
         files: staged ? state.staged : state.unstaged,
       }]);
-      const next = nextChangeAfterIndex(before, after, {
+      const next = nextChangeAfterIndex(before, after, [{
         ...target,
         worktreePath: repo.repoPath,
         action,
-      });
+      }]);
       selectedFile.value = next ? { file: next.file, staged } : undefined;
+      const sourceSelection = staged ? stagedSelection : unstagedSelection;
+      sourceSelection.state.replace(next ? fileTreeSelectionKey('', next.file.path) : undefined);
     }
     if (headChanged) {
       historyRefreshKey.value++;
@@ -185,7 +212,7 @@ async function changeIndex(target: GitIndexTarget, action: GitIndexAction) {
       statusReady.value = false;
     }
   } finally {
-    pendingIndexPath.value = undefined;
+    pendingIndexPaths.value = [];
     busy.value = false;
   }
 }
@@ -298,7 +325,9 @@ onBeforeUnmount(() => {
         :status="status"
         :status-ready="statusReady"
         :selected="selectedFile"
-        :pending-path="pendingIndexPath"
+        :unstaged-selection="unstagedSelection"
+        :staged-selection="stagedSelection"
+        :pending-paths="pendingIndexPaths"
         :diff="diff"
         :diff-error="diffError"
         :error="error"

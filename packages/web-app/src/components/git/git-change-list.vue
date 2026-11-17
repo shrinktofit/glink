@@ -1,16 +1,18 @@
 <script setup lang="ts">
-import { computed, inject } from 'vue';
+import { computed, inject, provide } from 'vue';
 import { GitIndexAction, type GitFileChange } from '@glink/protocol/git';
 import DiffTree from '../diff-tree.vue';
 import { gitRepoServiceKey } from '../../git/git-repo-service';
 import { gitChangesTreeStateKey } from '../../git/git-changes-tree-state-key';
 import { GitIndexScope, type GitIndexTarget } from '../../git/git-index-target';
+import { fileTreeSelectionScopeKey, type FileTreeSelectionScope } from '../file-tree-selection';
 
 const props = defineProps<{
   items: GitFileChange[];
   staged: boolean;
   selectedPath?: string;
-  pendingPath?: string;
+  selection: FileTreeSelectionScope;
+  pendingPaths: readonly string[];
   busy: boolean;
   loading: boolean;
   ready: boolean;
@@ -21,6 +23,7 @@ const emit = defineEmits<{
 }>();
 const action = computed(() => props.staged ? GitIndexAction.unstage : GitIndexAction.stage);
 const repo = inject(gitRepoServiceKey)!;
+provide(fileTreeSelectionScopeKey, props.selection);
 
 function changeIndex(file: GitFileChange) {
   if (!props.busy && !props.loading && (props.staged || !file.stageBlockedReason)) {
@@ -45,14 +48,18 @@ function changeIndex(file: GitFileChange) {
         :state-key="gitChangesTreeStateKey(repo.repoPath, staged)"
         :data-ready="ready"
         reveal-selection
+        selection-group=""
         :model-value="selectedPath"
-        :disabled-paths="pendingPath ? [pendingPath] : undefined"
+        :disabled-paths="pendingPaths"
         :index-action="action"
         :index-disabled="busy || loading"
         @select="emit('select', $event)"
         @activate="changeIndex"
         @index-directory="
           emit('changeIndex', { scope: GitIndexScope.directory, path: $event }, action)
+        "
+        @index-selection="
+          emit('changeIndex', { scope: GitIndexScope.paths, paths: $event[0].paths }, action)
         "
       >
         <template #actions="{ item }">
