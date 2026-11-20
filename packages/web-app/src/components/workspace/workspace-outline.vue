@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, inject, ref, useTemplateRef } from 'vue';
+import { computed, inject, nextTick, ref, useTemplateRef } from 'vue';
 import { RouterLink } from 'vue-router';
 import { appKey } from '../../app-context';
 import { RouteName } from '../../router';
@@ -8,9 +8,15 @@ import {
   type WorkspaceDocument,
   type WorkspaceProject,
   type WorkspaceProjectStatus,
+  type ProjectDisableConfirmation,
 } from '@glink/protocol/workspace';
 import type { WorkspaceService } from '../../workspace/workspace-service';
 import WorkspaceProjectEditor from './workspace-project-editor.vue';
+import WorkspaceProjectDisableDialog from './workspace-project-disable-dialog.vue';
+import WorktreeStateIcon, { WorktreeState } from './worktree-state-icon.vue';
+import {
+  ProjectDisableConfirmationError,
+} from '../../workspace/project-disable-confirmation-error';
 const props = defineProps<{
   workspace: WorkspaceDocument;
   statuses: WorkspaceProjectStatus[];
@@ -22,15 +28,27 @@ const app = inject(appKey)!;
 const expanded = defineModel<boolean>('expanded');
 const emit = defineEmits<{
   changed: [workspace: WorkspaceDocument];
-  select: [projectId: string, event: MouseEvent];
+  select: [projectId: string, event: MouseEvent, order: readonly string[]];
 }>();
 const editing = ref<WorkspaceProject>();
 const context = ref<{ id?: string; x: number; y: number }>();
+const contextMenu = useTemplateRef<HTMLElement>('context-menu');
+const disabling = ref<{ project: WorkspaceProject; confirmation: ProjectDisableConfirmation }>();
+const disableError = ref('');
 const addDialog = useTemplateRef<HTMLDialogElement>('add-dialog');
 const path = ref('');
 const parent = ref('');
 const working = ref(false);
 const error = ref('');
+const projectNameCollator = new Intl.Collator(undefined, { numeric: true, sensitivity: 'base' });
+const orderedProjects = computed(() => [...props.workspace.projects].sort((left, right) =>
+  Number(right.enabled) - Number(left.enabled)
+  || projectNameCollator.compare(left.name, right.name),
+));
+const orderedProjectIds = computed(() => orderedProjects.value.map((project) => project.id));
+const enabledProjects = computed(() =>
+  props.workspace.projects.filter((project) => project.enabled),
+);
 const selectedProject = computed(() =>
   props.workspace.projects.find((project) => project.id === context.value?.id),
 );
@@ -39,24 +57,34 @@ function status(id: string) {
   return props.statuses.find((item) => item.projectId === id);
 }
 
-function state(id: string) {
+function state(id: string): WorktreeState {
   const value = status(id);
   if (!value) {
-    return '…';
+    return WorktreeState.loading;
   }
   if (value.error) {
-    return '!';
+    return WorktreeState.unavailable;
   }
-  return value.staged.length || value.unstaged.length ? '●' : '○';
+  return value.staged.length || value.unstaged.length
+    ? WorktreeState.modified
+    : WorktreeState.clean;
 }
 
 function projectTitle(project: WorkspaceProject) {
   const value = status(project.id);
-  const clean = value?.error ?? (state(project.id) === '●' ? 'Not clean' : 'Clean');
+  const clean = value?.error ?? (value
+    ? state(project.id) === WorktreeState.modified ? 'Not clean' : 'Clean'
+    : '正在读取工作树状态');
   const lines = [
     project.worktreePath,
     `${clean} · ${project.settled ? 'Settled' : 'Unsettled'}`,
   ];
+  if (!project.enabled) {
+    lines.push('已停用');
+  }
+  if (bindingChanged(project)) {
+    lines.push('实际分支／HEAD 与配置的关联不一致。');
+  }
   if (value && !value.error && value.baselineCommit === project.baseline?.commit
     && value.aheadCount) {
     lines.push(`Ahead ${value.aheadCount} ${value.aheadCount === 1 ? 'commit' : 'commits'}`);
@@ -78,12 +106,19 @@ function locked(id: string) {
   );
 }
 
-function menu(event: MouseEvent, id?: string) {
+async function menu(event: MouseEvent, id?: string) {
   context.value = {
     id,
-    x: Math.min(event.clientX, window.innerWidth - 220),
-    y: Math.min(event.clientY, window.innerHeight - 150),
+    x: event.clientX,
+    y: event.clientY,
   };
+  await nextTick();
+  const bounds = contextMenu.value?.getBoundingClientRect();
+  if (bounds && context.value) {
+    context.value.x = Math.max(4, Math.min(event.clientX, window.innerWidth - bounds.width - 4));
+    context.value.y = Math.max(4, Math.min(event.clientY, window.innerHeight - bounds.height - 4));
+    contextMenu.value?.querySelector<HTMLElement>('[role="menuitem"]:not(:disabled)')?.focus();
+  }
 }
 
 function add(parentId = '') {
@@ -128,7 +163,31 @@ function edit(id: string) {
   editing.value = props.workspace.projects.find((project) => project.id === id);
 }
 
-defineExpose({ edit });
+async function setEnabled(project: WorkspaceProject, enabled: boolean, confirmDisable?: boolean) {
+  context.value = undefined;
+  working.value = true;
+  error.value = '';
+  disableError.value = '';
+  try {
+    const workspace = await props.service.setProjectEnabled(
+      props.workspace.id, project.id, enabled, confirmDisable,
+    );
+    disabling.value = undefined;
+    emit('changed', workspace);
+  } catch (cause: unknown) {
+    if (cause instanceof ProjectDisableConfirmationError) {
+      disabling.value = { project, confirmation: cause.confirmation };
+    } else if (disabling.value) {
+      disableError.value = String(cause);
+    } else {
+      error.value = String(cause);
+    }
+  } finally {
+    working.value = false;
+  }
+}
+
+defineExpose({ edit, menu });
 </script>
 <template>
   <aside
@@ -155,10 +214,10 @@ defineExpose({ edit });
       aria-label="Workspace outline"
     >
       <div
-        v-for="project in workspace.projects"
+        v-for="project in orderedProjects"
         :key="project.id"
         class="project-row"
-        :class="{ selected: selected.includes(project.id) }"
+        :class="{ selected: selected.includes(project.id), inactive: !project.enabled }"
         @contextmenu.stop.prevent="menu($event, project.id)"
       >
         <button
@@ -166,12 +225,12 @@ defineExpose({ edit });
           :class="{ 'binding-changed': bindingChanged(project) }"
           :title="projectTitle(project)"
           :aria-pressed="selected.includes(project.id)"
-          @click="emit('select', project.id, $event)"
+          @click="emit('select', project.id, $event, orderedProjectIds)"
         >
-          <span
+          <worktree-state-icon
             class="clean-state"
-            :class="{ dirty: state(project.id) === '●', unavailable: state(project.id) === '!' }"
-          >{{ state(project.id) }}</span>
+            :state="state(project.id)"
+          />
           <span class="name">{{ project.name }}</span>
           <span
             class="settlement"
@@ -203,12 +262,19 @@ defineExpose({ edit });
       {{ error }}
     </p>
     <div class="legend muted">
-      <span class="dirty">●</span> Not clean · ○ Clean<br><span class="settled">✓</span> Settled ·
-      ○ Unsettled
+      <div class="legend-line">
+        <span class="legend-item"><worktree-state-icon
+          :state="WorktreeState.modified"
+        />Not clean</span>
+        <span class="legend-item"><worktree-state-icon
+          :state="WorktreeState.clean"
+        />Clean</span>
+      </div>
+      <div><span class="settled">✓</span> Settled · ○ Unsettled</div>
     </div>
     <footer class="muted">
-      {{ workspace.projects.filter((project) => project.settled).length }} /
-      {{ workspace.projects.length }} settled
+      {{ enabledProjects.filter((project) => project.settled).length }} /
+      {{ enabledProjects.length }} settled
     </footer>
     <button
       class="outline-toggle"
@@ -224,6 +290,7 @@ defineExpose({ edit });
         @click="context = undefined"
       />
       <div
+        ref="context-menu"
         class="context command-menu"
         role="menu"
         :style="{ left: `${context.x}px`, top: `${context.y}px` }"
@@ -262,6 +329,13 @@ defineExpose({ edit });
           >
             编辑 Project
           </button>
+          <button
+            role="menuitem"
+            :disabled="busy || working"
+            @click="setEnabled(selectedProject, !selectedProject.enabled)"
+          >
+            {{ selectedProject.enabled ? '停用 Project' : '启用 Project' }}
+          </button>
           <hr role="separator">
           <button
             role="menuitem"
@@ -285,6 +359,15 @@ defineExpose({ edit });
         </template>
       </div>
     </template>
+    <workspace-project-disable-dialog
+      v-if="disabling"
+      :project-name="disabling.project.name"
+      :confirmation="disabling.confirmation"
+      :busy="working"
+      :error="disableError"
+      @cancel="disabling = undefined"
+      @confirm="setEnabled(disabling.project, false, true)"
+    />
     <dialog
       ref="add-dialog"
       @cancel="working && $event.preventDefault()"
@@ -386,6 +469,14 @@ strong {
 .project-row.selected {
   background: var(--ws-active);
 }
+.project-row.inactive {
+  color: var(--ws-muted);
+  .project-pick,
+  .ws-icon { opacity: var(--ws-inactive-opacity); }
+  .clean-state,
+  .settlement,
+  .binding-changed .name::after { color: inherit; }
+}
 .project-pick {
   display: flex;
   align-items: center;
@@ -405,15 +496,8 @@ strong {
   content: ' ↯';
   color: var(--ws-orange);
 }
-.clean-state,
 .settlement {
   color: var(--ws-muted);
-}
-.dirty {
-  color: var(--ws-orange);
-}
-.unavailable {
-  color: var(--ws-red);
 }
 .settled {
   color: var(--ws-green);
@@ -422,6 +506,16 @@ strong {
   font-size: 0.8em;
   line-height: 1.8;
   margin: 1em 0;
+}
+.legend-line,
+.legend-item {
+  display: flex;
+  align-items: center;
+  gap: 0.4em;
+}
+.legend-line {
+  flex-wrap: wrap;
+  gap: 0.8em;
 }
 footer {
   font-size: 0.85em;

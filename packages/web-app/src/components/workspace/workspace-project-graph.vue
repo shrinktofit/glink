@@ -8,7 +8,13 @@ import {
 const props = defineProps<{ workspace: WorkspaceDocument;
   selected: readonly string[];
   statuses: WorkspaceProjectStatus[]; }>();
-const emit = defineEmits<{ select: [id: string, event: MouseEvent]; edit: [id: string] }>();
+const emit = defineEmits<{
+  select: [id: string, event: MouseEvent];
+  edit: [id: string];
+  contextmenu: [event: MouseEvent, id: string];
+}>();
+const enabledIds = computed(() => new Set(props.workspace.projects
+  .filter((project) => project.enabled).map((project) => project.id)));
 
 function liveState(id: string) {
   const status = props.statuses.find((item) => item.projectId === id);
@@ -66,7 +72,10 @@ function edgePath(from: string, to: string) {
           :d="edgePath(edge.from, edge.to)"
           fill="none"
           :stroke="
-            edge.kind === WorkspaceConnectionKind.submodule ? 'var(--ws-green)' : 'var(--ws-blue)'
+            !enabledIds.has(edge.from) || !enabledIds.has(edge.to)
+              ? 'var(--ws-muted)'
+              : edge.kind === WorkspaceConnectionKind.submodule
+                ? 'var(--ws-green)' : 'var(--ws-blue)'
           "
           :stroke-dasharray="edge.kind === WorkspaceConnectionKind.manual ? '4 3' : undefined"
           stroke-width="1.5"
@@ -76,12 +85,13 @@ function edgePath(from: string, to: string) {
         v-for="node in layout"
         :key="node.id"
         class="node"
-        :class="{ selected: selected.includes(node.id) }"
+        :class="{ selected: selected.includes(node.id), inactive: !node.enabled }"
         :style="{ left: `${node.x}px`, top: `${node.y}px` }"
+        @contextmenu.stop.prevent="emit('contextmenu', $event, node.id)"
       >
         <button
           class="node-pick"
-          :title="node.worktreePath"
+          :title="`${node.worktreePath}\n${node.enabled ? '已启用' : '已停用'}`"
           :aria-pressed="selected.includes(node.id)"
           @click="emit('select', node.id, $event)"
         >
@@ -129,6 +139,12 @@ svg {
 .node.selected {
   border-color: var(--ws-blue);
   box-shadow: 0 0 0 1px var(--ws-blue);
+}
+.node.inactive {
+  color: var(--ws-muted);
+  .node-pick,
+  .edit { opacity: var(--ws-inactive-opacity); }
+  .settled { color: inherit; }
 }
 .node-pick {
   display: flex;

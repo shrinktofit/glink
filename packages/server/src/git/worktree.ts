@@ -13,6 +13,7 @@ import { GitSubmoduleDirtyError } from './git-submodule-dirty-error.ts';
 import { readChangesSnapshot, readStatusEntries, type StatusEntry } from './read-changes.ts';
 import { runGit } from './run-git.ts';
 import { withGitIndex } from './index-queue.ts';
+import { indexStageBlocker } from './index-stage-blocker.ts';
 
 export async function readWorktreeStatus(
   repoPath: string, signal?: AbortSignal,
@@ -163,7 +164,11 @@ export class GitIndexTransaction {
     return readChangesSnapshot(this.repoPath, { indexPath: this.indexPath, submodules });
   }
 
-  async change(path: string, action: GitIndexAction): Promise<ChangesSnapshot> {
+  async change(
+    path: string,
+    action: GitIndexAction,
+    stageBlockers?: ReadonlyMap<string, Error>,
+  ): Promise<ChangesSnapshot> {
     const state = action === GitIndexAction.stage
       ? await readStatusEntries(this.repoPath, [path])
       : await readIndexChanges(this.repoPath);
@@ -178,22 +183,35 @@ export class GitIndexTransaction {
     if (action === GitIndexAction.stage && file.stageBlockedReason) {
       throw new GitSubmoduleDirtyError(file.stageBlockedReason);
     }
+    const blocker = action === GitIndexAction.stage && indexStageBlocker(file, stageBlockers);
+    if (blocker) {
+      throw blocker;
+    }
     await this._write([file], action, state.head);
     return this.readChanges(this._changesSubmoduleMembership(entry, file, action));
   }
 
-  async changeAll(action: GitIndexAction, directory?: string): Promise<ChangesSnapshot> {
+  async changeAll(
+    action: GitIndexAction,
+    directory?: string,
+    stageBlockers?: ReadonlyMap<string, Error>,
+  ): Promise<ChangesSnapshot> {
     return this._changeBatch(action,
       (file) => directory === undefined || file.path.startsWith(`${directory}/`),
-      directory === undefined ? undefined : [directory]);
+      directory === undefined ? undefined : [directory],
+      stageBlockers);
   }
 
-  changePaths(paths: readonly string[], action: GitIndexAction): Promise<ChangesSnapshot> {
+  changePaths(
+    paths: readonly string[],
+    action: GitIndexAction,
+    stageBlockers?: ReadonlyMap<string, Error>,
+  ): Promise<ChangesSnapshot> {
     if (paths.length === 1) {
-      return this.change(paths[0], action);
+      return this.change(paths[0], action, stageBlockers);
     }
     const selected = new Set(paths);
-    return this._changeBatch(action, (file) => selected.has(file.path));
+    return this._changeBatch(action, (file) => selected.has(file.path), undefined, stageBlockers);
   }
 
   async commit(input: GitCommitInput) {
@@ -219,6 +237,7 @@ export class GitIndexTransaction {
     action: GitIndexAction,
     includes: (file: GitFileChange) => boolean,
     statusPaths?: readonly string[],
+    stageBlockers?: ReadonlyMap<string, Error>,
   ) {
     const state = action === GitIndexAction.stage
       ? await readStatusEntries(this.repoPath, statusPaths)
@@ -226,7 +245,8 @@ export class GitIndexTransaction {
     const selected = state.entries.flatMap((entry) => {
       const file = action === GitIndexAction.stage ? entry.unstaged : entry.staged;
       if (!file || !includes(file)
-        || (action === GitIndexAction.stage && file.stageBlockedReason)) {
+        || (action === GitIndexAction.stage
+          && (file.stageBlockedReason || indexStageBlocker(file, stageBlockers)))) {
         return [];
       }
       return [{ entry, file }];

@@ -21,6 +21,7 @@ import {
   type BaselineRefComparison,
   type ProjectBaseline,
 } from '@glink/protocol/workspace';
+import { ProjectDisableConfirmationError } from './project-disable-confirmation-error';
 
 export class WorkspaceService {
   static catalog(signal?: AbortSignal) {
@@ -113,6 +114,15 @@ export class WorkspaceService {
       `/projects/${encodeURIComponent(projectId)}`,
       'PATCH',
       input,
+    );
+  }
+
+  setProjectEnabled(id: string, projectId: string, enabled: boolean, confirmDisable?: boolean) {
+    return this._request<WorkspaceDocument>(
+      id,
+      `/projects/${encodeURIComponent(projectId)}/enabled`,
+      'POST',
+      { enabled, confirmDisable },
     );
   }
 
@@ -221,6 +231,9 @@ export class WorkspaceService {
     });
     const value = await response.json();
     if (!response.ok) {
+      if (value.disableConfirmation) {
+        throw new ProjectDisableConfirmationError(value.error, value.disableConfirmation);
+      }
       throw new Error(value.error ?? `Request failed (${response.status}).`);
     }
     return value as T;

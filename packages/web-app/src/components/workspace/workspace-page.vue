@@ -133,17 +133,21 @@ watch(projectIds, (ids, previous) => {
   }
 });
 
-function selectProject(id: string, event: MouseEvent) {
+function selectProject(
+  id: string,
+  event: MouseEvent,
+  order: readonly string[] = projectIds.value,
+) {
   const ids = projectIds.value;
   let next = new Set(selectedProjectIds.value);
   const additive = event.ctrlKey || event.metaKey;
   if (event.shiftKey) {
-    const start = ids.indexOf(projectSelectionAnchor.value ?? id);
-    const end = ids.indexOf(id);
+    const start = order.indexOf(projectSelectionAnchor.value ?? id);
+    const end = order.indexOf(id);
     if (!additive) {
       next.clear();
     }
-    for (const projectId of ids.slice(Math.min(start, end), Math.max(start, end) + 1)) {
+    for (const projectId of order.slice(Math.min(start, end), Math.max(start, end) + 1)) {
       next.add(projectId);
     }
     projectSelectionAnchor.value ??= id;
@@ -783,6 +787,7 @@ onUnmounted(() => {
         :statuses="statuses"
         @select="selectProject"
         @edit="outline!.edit($event)"
+        @contextmenu="(event, id) => outline!.menu(event, id)"
       />
     </section>
   </main>

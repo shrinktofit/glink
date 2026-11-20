@@ -20,6 +20,8 @@ import {
 } from './workspace-git.ts';
 import { checkReferenceName, readCommitSha, readReferenceCommit } from './project-references.ts';
 import { WorkspaceError } from './workspace-error.ts';
+import { withProjectDisableCheck } from './project-enablement.ts';
+import { ProjectDisableConfirmationError } from './project-disable-confirmation-error.ts';
 
 function isBaseline(value: unknown): value is ProjectBaseline {
   const baseline = value as ProjectBaseline | undefined;
@@ -66,7 +68,7 @@ function validateGraph(document: WorkspaceDocument) {
 function validateDocument(value: unknown): asserts value is WorkspaceDocument {
   const doc = value as WorkspaceDocument | undefined;
   if (
-    doc?.version !== 2
+    doc?.version !== 3
     || typeof doc.id !== 'string'
     || typeof doc.name !== 'string'
     || !Array.isArray(doc.projects)
@@ -81,6 +83,7 @@ function validateDocument(value: unknown): asserts value is WorkspaceDocument {
       || typeof project.name !== 'string'
       || typeof project.worktreePath !== 'string'
       || typeof project.settled !== 'boolean'
+      || typeof project.enabled !== 'boolean'
       || (project.baseline !== undefined && !isBaseline(project.baseline))
       || !project.binding
       || !Object.values(GitRevisionKind).includes(project.binding.kind)
@@ -171,7 +174,7 @@ export class WorkspaceStore {
       }
       const now = new Date().toISOString();
       const document: WorkspaceDocument = {
-        version: 2,
+        version: 3,
         id: randomUUID(),
         name: input.name.trim(),
         createdAt: now,
@@ -287,7 +290,18 @@ export class WorkspaceStore {
     return this.mutate(async () => {
       const document = await this.get(id);
       const project = this.project(document, projectId);
-      const { manualDependencyIds, baseline, ...values } = patch;
+      const {
+        enabled,
+        confirmDisable,
+        manualDependencyIds,
+        baseline,
+        ...values
+      } = patch;
+      if ((enabled !== undefined && typeof enabled !== 'boolean')
+        || (confirmDisable !== undefined
+          && (typeof confirmDisable !== 'boolean' || enabled !== false))) {
+        throw new WorkspaceError('Invalid Project enabled state.');
+      }
       const dependencies = document.connections.filter((edge) => edge.from === projectId);
 
       const dependencyIds = manualDependencyIds === undefined
@@ -299,14 +313,28 @@ export class WorkspaceStore {
           ...manualDependencyIds,
         ];
 
-      return this._applyProjectUpdate(document, projectId, {
-        name: project.name,
-        settled: project.settled,
-        baseline: baseline === null ? undefined : baseline ?? project.baseline,
-        binding: project.binding,
-        ...values,
-        dependencyIds,
-      });
+      const save = async () => {
+        if (enabled !== undefined) {
+          project.enabled = enabled;
+        }
+        return this._applyProjectUpdate(document, projectId, {
+          name: project.name,
+          settled: project.settled,
+          baseline: baseline === null ? undefined : baseline ?? project.baseline,
+          binding: project.binding,
+          ...values,
+          dependencyIds,
+        });
+      };
+      if (project.enabled && enabled === false) {
+        return withProjectDisableCheck(document, project, async (reasons) => {
+          if (reasons.length && !confirmDisable) {
+            throw new ProjectDisableConfirmationError(project.id, reasons);
+          }
+          return save();
+        });
+      }
+      return save();
     });
   }
 
@@ -498,6 +526,7 @@ export class WorkspaceStore {
         }
         : undefined,
       settled: false,
+      enabled: true,
       binding: info?.branch
         ? { kind: GitRevisionKind.branch, revision: `refs/heads/${info.branch}` }
         : { kind: GitRevisionKind.commit, revision: head ?? '' },

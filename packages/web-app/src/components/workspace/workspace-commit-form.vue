@@ -11,20 +11,37 @@ const props = defineProps<{
 const emit = defineEmits<{ submit: [projectIds: string[], message: string, amend: boolean] }>();
 const filter = useWorkspaceCommitFilterStore();
 const projectIds = computed(() => props.workspace.projects.map((project) => project.id));
+const enabledProjects = computed(() =>
+  props.workspace.projects.filter((project) => project.enabled),
+);
+const enabledIds = computed(() => enabledProjects.value.map((project) => project.id));
 const selected = computed({
   get() {
     const excluded = new Set(filter.excluded[props.workspace.id] ?? []);
-    return projectIds.value.filter((id) => !excluded.has(id));
+    return enabledIds.value.filter((id) => !excluded.has(id));
   },
   set(ids: string[]) {
     const included = new Set(ids);
-    filter.excludeProjects(props.workspace.id, projectIds.value.filter((id) => !included.has(id)));
+    const excluded = new Set(filter.excluded[props.workspace.id] ?? []);
+    for (const id of enabledIds.value) {
+      if (included.has(id)) {
+        excluded.delete(id);
+      } else {
+        excluded.add(id);
+      }
+    }
+    filter.excludeProjects(props.workspace.id, projectIds.value.filter((id) => excluded.has(id)));
   },
 });
 const message = ref('');
 const description = ref('');
 const showFilter = ref(false);
 const amend = ref(false);
+watch(enabledIds, (ids) => {
+  if (!ids.length) {
+    showFilter.value = false;
+  }
+});
 watch(
   [() => props.workspace.id, projectIds],
   ([workspaceId, ids]) => filter.pruneProjects(workspaceId, ids),
@@ -122,18 +139,18 @@ defineExpose({ clear });
         <button
           type="button"
           class="ws-button"
-          :disabled="busy"
+          :disabled="busy || !enabledProjects.length"
           :aria-expanded="showFilter"
           @click="showFilter = !showFilter"
         >
-          Projects · {{ selected.length }}/{{ workspace.projects.length }} ▾
+          Projects · {{ selected.length }}/{{ enabledProjects.length }} ▾
         </button>
         <div
           v-if="showFilter"
           class="filter-popover ws-panel"
         >
           <label
-            v-for="project in workspace.projects"
+            v-for="project in enabledProjects"
             :key="project.id"
             class="ws-check"
           ><input

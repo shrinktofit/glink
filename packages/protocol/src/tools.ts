@@ -109,6 +109,8 @@ export const workspaceTools = {
       + 'refs/remotes/ or refs/tags/ names. '
       + 'baseline pins a commit SHA with an optional source ref; '
       + 'it never follows that ref automatically. Use null to clear baseline. '
+      + 'enabled controls participation in this workspace. When disabling requires confirmation, '
+      + 'review the returned reasons with the user before retrying with confirmDisable=true. '
       + 'manualDependencyIds replaces manual outgoing '
       + 'dependencies; automatic submodule edges stay.',
     access: ToolAccess.write,
@@ -116,6 +118,8 @@ export const workspaceTools = {
       ...projectId,
       changes: z.strictObject({
         name: z.string().trim().min(1).optional(),
+        enabled: z.boolean().optional(),
+        confirmDisable: z.boolean().optional(),
         settled: z.boolean().optional(),
         baseline: z.strictObject({
           commit: z.string().trim().regex(/^[a-f0-9]{4,64}$/i),

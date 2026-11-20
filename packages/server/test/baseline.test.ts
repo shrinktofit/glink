@@ -114,7 +114,7 @@ describe('Pinned workspace baselines and Git references through the public HTTP 
     /// @expect Store the complete commit and actual ref without guessing another matching branch.
     const sha = await git('rev-parse', 'HEAD');
     const attached = await createWorkspace();
-    expect(attached.version).toBe(2);
+    expect(attached.version).toBe(3);
     expect(attached.projects[0].baseline).toEqual({ commit: sha, ref: 'refs/heads/main' });
     expect(attached.projects[0].binding).toEqual({ kind: 'branch', revision: 'refs/heads/main' });
 

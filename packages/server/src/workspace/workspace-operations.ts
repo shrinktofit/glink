@@ -8,19 +8,32 @@ import {
   type WorkspaceCommitResult,
   type WorkspaceProject,
   type WorkspaceProjectStatus,
+  type WorkspaceDocument,
 } from '@glink/protocol/workspace';
 import { GitIndexTransaction } from '../git/worktree.ts';
 import { readProjectCommits, readProjectStatus } from './workspace-git.ts';
 import { WorkspaceStore } from './workspace-store.ts';
 import { WorkspaceError } from './workspace-error.ts';
+import {
+  applyProjectEnablementStatus,
+  projectPointerCommitBlocker,
+  readDisabledSubmodulePointers,
+} from './project-enablement.ts';
 
 export async function workspaceStatuses(
+  document: WorkspaceDocument,
   projects: readonly WorkspaceProject[], signal?: AbortSignal,
 ): Promise<WorkspaceProjectStatus[]> {
   return Promise.all(
     projects.map(async (project) => {
       try {
-        return await readProjectStatus(project, signal);
+        const [status, blockers] = await Promise.all([
+          readProjectStatus(project, signal),
+          readDisabledSubmodulePointers(project,
+            document.projects.filter((child) => !child.enabled),
+            signal),
+        ]);
+        return applyProjectEnablementStatus(project, status, blockers);
       } catch (error: unknown) {
         signal?.throwIfAborted();
         return {
@@ -94,7 +107,16 @@ export async function commitWorkspace(
   const snapshots = new Map<string, WorkspaceProjectStatus>();
   for (const projectId of selected) {
     const project = store.project(document, projectId);
+    if (!project.enabled) {
+      throw new WorkspaceError(`${project.name} 已停用，不参与工作区提交。`, 409);
+    }
     const status = await readProjectStatus(project);
+    const blockers = await readDisabledSubmodulePointers(project,
+      document.projects.filter((child) => !child.enabled));
+    const blockedPointer = projectPointerCommitBlocker(status, blockers);
+    if (blockedPointer) {
+      throw blockedPointer;
+    }
     const expected = input.expected.find((entry) => entry.projectId === projectId);
     if (
       !expected
@@ -144,8 +166,18 @@ export async function commitWorkspace(
     try {
       await GitIndexTransaction.run(project.worktreePath, async (index) => {
         const before = snapshots.get(projectId)!;
-        const currentProject = store.project(await store.get(id), projectId);
+        const currentDocument = await store.get(id);
+        const currentProject = store.project(currentDocument, projectId);
+        if (!currentProject.enabled) {
+          throw new WorkspaceError(`${project.name} 已停用，不参与工作区提交。`, 409);
+        }
+        const blockers = await readDisabledSubmodulePointers(currentProject,
+          currentDocument.projects.filter((child) => !child.enabled));
         const current = await readProjectStatus(currentProject);
+        const blockedPointer = projectPointerCommitBlocker(current, blockers);
+        if (blockedPointer) {
+          throw blockedPointer;
+        }
         if (current.head !== before.head || current.indexFingerprint !== before.indexFingerprint
           || (input.amend && current.baselineCommit !== before.baselineCommit)) {
           throw new WorkspaceError(`${project.name} changed during the workspace commit.`, 409);
@@ -173,7 +205,7 @@ export async function commitWorkspace(
               409,
             );
           }
-          await index.change(path, GitIndexAction.stage);
+          await index.change(path, GitIndexAction.stage, blockers);
         }
         if (!input.amend && !(await index.readChanges()).staged.length) {
           result.skipped.push(projectId);

@@ -13,8 +13,11 @@ import {
   type CreateWorkspaceInput,
   type UpdateProjectInput,
   type WorkspaceCommitInput,
+  type PatchProjectInput,
 } from '@glink/protocol/workspace';
-import { changeAllIndex, changeIndex, changeIndexPaths, readFileDiff } from '../git/worktree.ts';
+import { readFileDiff } from '../git/worktree.ts';
+import { changeWorkspaceIndex } from './workspace-index.ts';
+import { ProjectDisableConfirmationError } from './project-disable-confirmation-error.ts';
 import { handleRequest } from '../request-handler.ts';
 import { commitWorkspace, workspaceHistory, workspaceStatuses } from './workspace-operations.ts';
 import { WorkspaceStore } from './workspace-store.ts';
@@ -61,7 +64,12 @@ export async function createGlinkRequestHandler(options: { glinkHome: string }) 
 
     response
       .writeHead(status, { 'Content-Type': 'application/json; charset=utf-8' })
-      .end(JSON.stringify({ error: message }));
+      .end(JSON.stringify({
+        error: message,
+        ...(error instanceof ProjectDisableConfirmationError
+          ? { disableConfirmation: error.confirmation }
+          : {}),
+      }));
   }
 
   async function toolRequest(request: IncomingMessage, response: ServerResponse, url: URL) {
@@ -82,7 +90,8 @@ export async function createGlinkRequestHandler(options: { glinkHome: string }) 
   async function readRequestedProjects(id: string, url: URL) {
     const document = await store.get(id);
     const ids = [...new Set(url.searchParams.getAll('projectId'))];
-    return ids.length ? ids.map((id) => store.project(document, id)) : document.projects;
+    const projects = ids.length ? ids.map((id) => store.project(document, id)) : document.projects;
+    return { document, projects };
   }
 
   async function workspaceRequest(request: IncomingMessage, response: ServerResponse, url: URL) {
@@ -151,6 +160,13 @@ export async function createGlinkRequestHandler(options: { glinkHome: string }) 
         commit: url.searchParams.get('commit') ?? '',
         ref: url.searchParams.get('ref') ?? '',
       }, signal);
+    } else if (id && section === 'projects' && projectId
+      && parts[3] === 'enabled' && method === 'POST') {
+      const input = await body<Pick<PatchProjectInput, 'enabled' | 'confirmDisable'>>(request);
+      if (typeof input.enabled !== 'boolean') {
+        throw new WorkspaceError('enabled must be a boolean.');
+      }
+      result = await store.patchProject(id, projectId, input);
     } else if (id && section === 'projects' && method === 'POST' && !projectId) {
       const input = await body<{ worktreePath: string; parentId?: string }>(request);
       result = await store.addProject(id, input.worktreePath, input.parentId);
@@ -159,9 +175,10 @@ export async function createGlinkRequestHandler(options: { glinkHome: string }) 
     } else if (id && section === 'projects' && projectId && method === 'DELETE') {
       result = await store.removeProject(id, projectId);
     } else if (id && section === 'status' && method === 'GET') {
-      result = await workspaceStatuses(await readRequestedProjects(id, url), signal);
+      const { document, projects } = await readRequestedProjects(id, url);
+      result = await workspaceStatuses(document, projects, signal);
     } else if (id && section === 'commits' && method === 'GET') {
-      result = await workspaceHistory(await readRequestedProjects(id, url), signal);
+      result = await workspaceHistory((await readRequestedProjects(id, url)).projects, signal);
     } else if (id && section === 'commit' && method === 'POST') {
       result = await commitWorkspace(store, id, await body<WorkspaceCommitInput>(request));
     } else if (id && section === 'diff' && method === 'GET') {
@@ -185,12 +202,9 @@ export async function createGlinkRequestHandler(options: { glinkHome: string }) 
         && (typeof input.directory !== 'string' || !input.directory)) {
         throw new WorkspaceError('Invalid directory.');
       }
-      const project = store.project(await store.get(id), input.projectId);
-      result = {
-        ...await changeAllIndex(project.worktreePath, input.action, input.directory),
-        projectId: project.id,
-        baselineCommit: project.baseline?.commit,
-      };
+      result = await changeWorkspaceIndex(store, id, input.projectId, (index, blockers) => {
+        return index.changeAll(input.action, input.directory, blockers);
+      });
     } else if (id && section === 'index-paths' && method === 'POST') {
       const input = await body<{
         projectId: string;
@@ -202,12 +216,9 @@ export async function createGlinkRequestHandler(options: { glinkHome: string }) 
         || !input.paths.every((path) => typeof path === 'string' && path.length > 0)) {
         throw new WorkspaceError('paths and a valid index action are required.');
       }
-      const project = store.project(await store.get(id), input.projectId);
-      result = {
-        ...await changeIndexPaths(project.worktreePath, input.paths, input.action),
-        projectId: project.id,
-        baselineCommit: project.baseline?.commit,
-      };
+      result = await changeWorkspaceIndex(store, id, input.projectId, (index, blockers) => {
+        return index.changePaths(input.paths, input.action, blockers);
+      });
     } else if (id && section === 'index' && method === 'POST') {
       const input = await body<{ projectId: string; path: string; action: GitIndexAction }>(
         request,
@@ -215,12 +226,9 @@ export async function createGlinkRequestHandler(options: { glinkHome: string }) 
       if (!Object.values(GitIndexAction).includes(input.action)) {
         throw new WorkspaceError('Invalid index action.');
       }
-      const project = store.project(await store.get(id), input.projectId);
-      result = {
-        ...await changeIndex(project.worktreePath, input.path, input.action),
-        projectId: project.id,
-        baselineCommit: project.baseline?.commit,
-      };
+      result = await changeWorkspaceIndex(store, id, input.projectId, (index, blockers) => {
+        return index.change(input.path, input.action, blockers);
+      });
     } else {
       throw new WorkspaceError('Workspace endpoint not found.', 404);
     }

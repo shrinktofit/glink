@@ -34,6 +34,7 @@ export interface WorkspaceProject {
   name: string;
   worktreePath: string;
   baseline?: ProjectBaseline;
+  enabled: boolean;
   settled: boolean;
   binding: GitRevision;
 }
@@ -45,7 +46,7 @@ export interface WorkspaceConnection {
 }
 
 export interface WorkspaceDocument {
-  version: 2;
+  version: 3;
   id: string;
   name: string;
   createdAt: string;
@@ -88,10 +89,17 @@ export interface UpdateProjectInput {
 /** Workspace-only metadata edits; association changes do not checkout the worktree. */
 export interface PatchProjectInput {
   name?: string;
+  enabled?: boolean;
+  confirmDisable?: boolean;
   settled?: boolean;
   baseline?: ProjectBaseline | null;
   binding?: WorkspaceProject['binding'];
   manualDependencyIds?: string[];
+}
+
+export interface ProjectDisableConfirmation {
+  projectId: string;
+  reasons: string[];
 }
 
 export interface WorkspaceProjectStatus extends WorktreeStatus {

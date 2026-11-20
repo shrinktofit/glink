@@ -258,6 +258,43 @@ describe('Glink workspace tool API against temporary Git repositories', () => {
     expect(await readFile(join(second, 'file.txt'), 'utf8')).toBe('base');
   }, 20000);
 
+  it('patches enablement through MCP with the same confirmation rules as the UI', async () => {
+    /// @case An MCP caller disables a dirty project, confirms, then edits unrelated metadata.
+    /// @expect Confirmation is required, enabled stays false and no Git mutation occurs.
+    const path = await repository('project');
+    const workspace = await call('create_workspace', {
+      name: 'MCP',
+      worktreePaths: [path],
+    });
+    const project = workspace.projects[0];
+    expect(project.enabled).toBe(true);
+    await writeFile(join(path, 'file.txt'), 'local edits');
+    const input = { workspaceId: workspace.id, projectId: project.id };
+    const refused = await requestTool('update_project', {
+      ...input,
+      changes: { enabled: false },
+    });
+    expect(refused.status).toBe(409);
+    const confirmation = await refused.json();
+    expect(confirmation.disableConfirmation.reasons.join('\n')).toContain('未提交');
+    await call('update_project', {
+      ...input,
+      changes: { enabled: false, confirmDisable: true },
+    });
+    const edited = await call('update_project', {
+      ...input,
+      changes: { name: 'Edited metadata' },
+    });
+    expect(edited.projects[0]).toMatchObject({ enabled: false, name: 'Edited metadata' });
+    const invalid = await requestTool('update_project', {
+      ...input,
+      changes: { enabled: true, confirmDisable: true },
+    });
+    expect(invalid.status).toBe(400);
+    expect(await git(path, 'diff', '--cached', '--name-only')).toBe('');
+    expect(await readFile(join(path, 'file.txt'), 'utf8')).toBe('local edits');
+  }, 20000);
+
   it('rejects invalid arguments, cycles and manual submodule disconnection', async () => {
     /// @case Tool calls attempt invalid patches and edits that violate workspace graph invariants.
     /// @expect Errors reach the caller and leave the saved document unchanged.

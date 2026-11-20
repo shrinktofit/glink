@@ -125,6 +125,263 @@ describe('Workspace HTTP operations in isolated temporary repositories', () => {
     await rm(directory, { recursive: true, force: true });
   });
 
+  it('defaults projects to enabled and preserves their state during synchronization', async () => {
+    /// @case A workspace includes manual projects and an automatically discovered submodule.
+    /// @expect Every new project is enabled; disabling a child survives refresh and metadata edits.
+    const source = await repository('source');
+    const parent = await repository('parent');
+    const manual = await repository('manual');
+    await git(parent, '-c', 'protocol.file.allow=always', 'submodule', 'add', source, 'child');
+    await git(parent, 'commit', '-am', 'Add child');
+    const workspace = await create([parent, manual]);
+    expect(workspace.projects).toHaveLength(3);
+    expect(workspace.projects.every((project) => 'enabled' in project && project.enabled === true))
+      .toBe(true);
+    const child = workspace.projects.find((project) => project.name === 'child')!;
+    const route = `workspaces/${workspace.id}`;
+    await request(`${route}/projects/${child.id}/enabled`, 'POST', { enabled: false });
+    const refreshed = await request<WorkspaceDocument>(route);
+    expect(refreshed.projects.find((project) => project.id === child.id))
+      .toHaveProperty('enabled', false);
+    expect(refreshed.projects.find((project) => project.id === workspace.projects[0].id))
+      .toHaveProperty('enabled', true);
+    await request(`${route}/projects/${child.id}`, 'PATCH', {
+      name: 'Renamed child',
+      settled: true,
+      baseline: child.baseline,
+      binding: child.binding,
+      dependencyIds: [],
+    });
+    await request(`${route}/projects/${workspace.projects[0].id}/enabled`, 'POST', {
+      enabled: false,
+    });
+    await git(parent, '-c', 'protocol.file.allow=always', 'submodule', 'add', source, 'new-child');
+    const synchronized = await request<WorkspaceDocument>(route);
+    expect(synchronized.projects.find((project) => project.name === 'new-child')?.enabled)
+      .toBe(true);
+    expect(synchronized.projects.find((project) => project.id === child.id))
+      .toMatchObject({ name: 'Renamed child', settled: true, enabled: false });
+    const file = join(home, 'workspaces', `${workspace.id}.glink-workspace.yaml`);
+    const saved = parse(await readFile(file, 'utf8')) as WorkspaceDocument;
+    expect(saved.projects.find((project) => project.id === child.id))
+      .toHaveProperty('enabled', false);
+  }, 60000);
+
+  it('requires confirmation for dirty or diverged projects without Git writes', async () => {
+    /// @case Disabling a project with local changes or commits ahead of its baseline is requested.
+    /// @expect Return confirmation reasons; only an explicit confirmation persists the flag.
+    const path = await repository('target');
+    const workspace = await create([path]);
+    const project = workspace.projects[0];
+    const route = `workspaces/${workspace.id}/projects/${project.id}/enabled`;
+    await writeFile(join(path, 'file.txt'), 'dirty\n');
+    interface Confirmation {
+      disableConfirmation: { reasons: string[] };
+    }
+    const refusal = await request<Confirmation>(route, 'POST', {
+      enabled: false,
+    }, 409);
+    expect(refusal.disableConfirmation.reasons.join('\n')).toContain('未提交');
+    await request(route, 'POST', { enabled: false, confirmDisable: true });
+    expect(await readFile(join(path, 'file.txt'), 'utf8')).toBe('dirty\n');
+    expect(await git(path, 'diff', '--cached', '--name-only')).toBe('');
+    await request(route, 'POST', { enabled: true });
+    await git(path, 'add', 'file.txt');
+    await git(path, 'commit', '-m', 'Ahead');
+    const ahead = await request<Confirmation>(route, 'POST', {
+      enabled: false,
+    }, 409);
+    expect(ahead.disableConfirmation.reasons.join('\n')).toContain('基线');
+  }, 60000);
+
+  it('skips disabled child pointers while batch staging ordinary files', async () => {
+    /// @case A disabled, clean child advances HEAD; its parent stages mixed selections.
+    /// @expect Single-pointer staging is rejected; batches stage only ordinary files.
+    const source = await repository('source');
+    const parent = await repository('parent');
+    await git(parent, '-c', 'protocol.file.allow=always', 'submodule', 'add', source, 'src/child');
+    await git(parent, 'commit', '-am', 'Add child');
+    const workspace = await create([parent]);
+    const root = workspace.projects[0];
+    const child = workspace.projects.find((project) => project.id !== root.id)!;
+    const route = `workspaces/${workspace.id}`;
+    await request(`${route}/projects/${child.id}/enabled`, 'POST', { enabled: false });
+    await git(child.worktreePath, 'commit', '--allow-empty', '-m', 'Outside workspace');
+    const pointer = await git(parent, 'rev-parse', ':src/child');
+    await writeFile(join(parent, 'src', 'ordinary.txt'), 'ordinary\n');
+    const blocked = await request<{ error: string }>(`${route}/index`, 'POST', {
+      projectId: root.id,
+      path: 'src/child',
+      action: 'stage',
+    }, 409);
+    expect(blocked.error).toContain('已停用');
+    for (const selection of [
+      { endpoint: 'index-all', fields: { directory: 'src' } },
+      { endpoint: 'index-paths', fields: { paths: ['src/child', 'src/ordinary.txt'] } },
+    ]) {
+      const state = await request<WorkspaceProjectStatus>(
+        `${route}/${selection.endpoint}`, 'POST', {
+          projectId: root.id,
+          action: 'stage',
+          ...selection.fields,
+        },
+      );
+      expect(state.staged.map((file) => file.path)).toEqual(['src/ordinary.txt']);
+      expect(state.unstaged.find((file) => file.path === 'src/child')?.stageBlockedReason)
+        .toContain('已停用');
+      expect(await git(parent, 'rev-parse', ':src/child')).toBe(pointer);
+      await request(`${route}/index-all`, 'POST', { projectId: root.id, action: 'unstage' });
+    }
+  }, 60000);
+
+  it('checks staged parent pointers and blocks their commit or amend after disabling', async () => {
+    /// @case A clean child is at its baseline but its parent already staged a newer pointer.
+    /// @expect Confirm disabling; allow parent commits only after unstaging the child's pointer.
+    const source = await repository('source');
+    const parent = await repository('parent');
+    await git(parent, '-c', 'protocol.file.allow=always', 'submodule', 'add', source, 'child');
+    await git(parent, 'commit', '-am', 'Add child');
+    const workspace = await create([parent]);
+    const root = workspace.projects[0];
+    const child = workspace.projects.find((project) => project.id !== root.id)!;
+    const route = `workspaces/${workspace.id}`;
+    const originalPointer = await git(parent, 'rev-parse', 'HEAD:child');
+    await git(child.worktreePath, 'commit', '--allow-empty', '-m', 'Next child revision');
+    const childHead = await git(child.worktreePath, 'rev-parse', 'HEAD');
+    await request(`${route}/projects/${child.id}`, 'PATCH', {
+      name: child.name,
+      settled: false,
+      baseline: { commit: childHead },
+      binding: child.binding,
+      dependencyIds: [],
+    });
+    await request('git/index', 'POST', {
+      repoPath: parent,
+      path: 'child',
+      action: 'stage',
+    });
+    const confirmation = await request<{ disableConfirmation: { reasons: string[] } }>(
+      `${route}/projects/${child.id}/enabled`, 'POST', { enabled: false }, 409,
+    );
+    expect(confirmation.disableConfirmation.reasons.join('\n')).toContain('父项目');
+    await request(`${route}/projects/${child.id}/enabled`, 'POST', {
+      enabled: false,
+      confirmDisable: true,
+    });
+    expect(await git(parent, 'rev-parse', ':child')).toBe(childHead);
+    await writeFile(join(parent, 'file.txt'), 'ordinary\n');
+    await stage(workspace, root.id);
+    let states = await request<WorkspaceProjectStatus[]>(`${route}/status`);
+    expect(states.find((state) => state.projectId === root.id)?.commitBlockedReason)
+      .toContain('已停用');
+    for (const amend of [false, true]) {
+      await request(`${route}/commit`, 'POST', {
+        projectIds: [root.id],
+        message: 'Blocked pointer',
+        expected: states,
+        amend,
+      }, 409);
+    }
+    await request(`${route}/commit`, 'POST', {
+      projectIds: [child.id],
+      message: 'Disabled child',
+      expected: states,
+    }, 409);
+    await request(`${route}/index`, 'POST', {
+      projectId: root.id,
+      path: 'child',
+      action: 'unstage',
+    });
+    states = await request<WorkspaceProjectStatus[]>(`${route}/status`);
+    const result = await request<WorkspaceCommitResult>(`${route}/commit`, 'POST', {
+      projectIds: [root.id],
+      message: 'Ordinary parent change',
+      expected: states,
+    });
+    expect(result.failed).toBeUndefined();
+    expect(await git(parent, 'rev-parse', 'HEAD:child')).toBe(originalPointer);
+    await writeFile(join(child.worktreePath, 'file.txt'), 'child remains dirty\n');
+    await writeFile(join(parent, 'file.txt'), 'amended ordinary\n');
+    await stage(workspace, root.id);
+    states = await request<WorkspaceProjectStatus[]>(`${route}/status`);
+    const amended = await request<WorkspaceCommitResult>(`${route}/commit`, 'POST', {
+      projectIds: [root.id],
+      message: 'Amended parent',
+      expected: states,
+      amend: true,
+    });
+    expect(amended.failed).toBeUndefined();
+    expect(await git(parent, 'show', 'HEAD:file.txt')).toBe('amended ordinary');
+    expect(await git(child.worktreePath, 'rev-parse', 'HEAD')).toBe(childHead);
+  }, 60000);
+
+  it('keeps manual dependencies independent and handles unavailable worktrees', async () => {
+    /// @case A manual dependency is disabled, then its directory becomes unavailable.
+    /// @expect The parent can commit; unavailable Git state requires confirmation to disable.
+    const parent = await repository('parent');
+    const dependency = await repository('dependency');
+    const workspace = await create([parent, dependency], [
+      { fromPath: parent, toPath: dependency },
+    ]);
+    const route = `workspaces/${workspace.id}`;
+    const child = workspace.projects[1];
+    await request(`${route}/projects/${child.id}/enabled`, 'POST', { enabled: false });
+    await writeFile(join(parent, 'file.txt'), 'parent\n');
+    await stage(workspace, workspace.projects[0].id);
+    const states = await request<WorkspaceProjectStatus[]>(`${route}/status`);
+    const result = await request<WorkspaceCommitResult>(`${route}/commit`, 'POST', {
+      projectIds: [workspace.projects[0].id],
+      message: 'Independent parent',
+      expected: states,
+    });
+    expect(result.failed).toBeUndefined();
+    await request(`${route}/projects/${child.id}/enabled`, 'POST', { enabled: true });
+    await rename(dependency, `${dependency}-moved`);
+    const check = await request<{ disableConfirmation: { reasons: string[] } }>(
+      `${route}/projects/${child.id}/enabled`, 'POST', { enabled: false }, 409,
+    );
+    expect(check.disableConfirmation.reasons.join('\n')).toContain('无法检查');
+    await request(`${route}/projects/${child.id}/enabled`, 'POST', {
+      enabled: false,
+      confirmDisable: true,
+    });
+  }, 60000);
+
+  it('protects disabled pointers after index entries and discovery edges disappear', async () => {
+    /// @case External Git removes a disabled child's index entry and workspace sync drops its edge.
+    /// @expect HEAD protects deletion and re-add; unstaging the deletion remains possible.
+    const source = await repository('source');
+    const parent = await repository('parent');
+    await git(parent, '-c', 'protocol.file.allow=always', 'submodule', 'add', source, 'child');
+    await git(parent, 'commit', '-am', 'Add child');
+    const workspace = await create([parent]);
+    const root = workspace.projects[0];
+    const child = workspace.projects[1];
+    const route = `workspaces/${workspace.id}`;
+    await request(`${route}/projects/${child.id}/enabled`, 'POST', { enabled: false });
+    await git(parent, 'rm', '--cached', 'child');
+    const synchronized = await request<WorkspaceDocument>(route);
+    expect(synchronized.connections).toEqual([]);
+    expect(synchronized.projects.find((project) => project.id === child.id)?.enabled).toBe(false);
+    const states = await request<WorkspaceProjectStatus[]>(`${route}/status`);
+    await request(`${route}/commit`, 'POST', {
+      projectIds: [root.id],
+      message: 'Delete disabled pointer',
+      expected: states,
+    }, 409);
+    await request(`${route}/index`, 'POST', {
+      projectId: root.id,
+      path: 'child/',
+      action: 'stage',
+    }, 409);
+    await request(`${route}/index`, 'POST', {
+      projectId: root.id,
+      path: 'child',
+      action: 'unstage',
+    });
+    expect(await git(parent, 'diff', '--cached', '--name-only')).toBe('');
+  }, 60000);
+
   it('streams ordered preflight states and attributes failures to the active check', async () => {
     /// @case A standalone main is inspected, then gains a linked worktree that prevents deletion.
     /// @expect Complete with a warning, or a topology error without a delete token.
@@ -337,6 +594,58 @@ describe('Workspace HTTP operations in isolated temporary repositories', () => {
     await writeFile(join(path, 'file.txt'), 'edit\n');
     return { marker, release };
   }
+
+  it('serializes disabling a child with queued writes to its parent pointer', async () => {
+    /// @case Parent staging holds the index while a child disable and a pointer stage overlap.
+    /// @expect A disabled child never gains a staged pointer through a stale workspace policy.
+    const source = await repository('source');
+    const parent = await repository('parent');
+    await git(parent, '-c', 'protocol.file.allow=always', 'submodule', 'add', source, 'child');
+    await git(parent, 'commit', '-am', 'Add child');
+    const workspace = await create([parent]);
+    const root = workspace.projects[0];
+    const child = workspace.projects[1];
+    const route = `workspaces/${workspace.id}`;
+    const oldPointer = await git(parent, 'rev-parse', ':child');
+    await git(child.worktreePath, 'commit', '--allow-empty', '-m', 'Next child revision');
+    await request(`${route}/projects/${child.id}`, 'PATCH', {
+      name: child.name,
+      settled: false,
+      baseline: { commit: await git(child.worktreePath, 'rev-parse', 'HEAD') },
+      binding: child.binding,
+      dependencyIds: [],
+    });
+    const { marker, release } = await slowCleanFilter(parent);
+    const pending = stage(workspace, root.id);
+    let disabling: Promise<Response> | undefined;
+    let staging: Promise<Response> | undefined;
+    try {
+      await expect.poll(async () => readFile(marker, 'utf8').catch(() => '')).not.toBe('');
+      disabling = fetch(`${origin}/api/${route}/projects/${child.id}/enabled`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ enabled: false }),
+      });
+      staging = fetch(`${origin}/api/${route}/index`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ projectId: root.id, path: 'child', action: 'stage' }),
+      });
+    } finally {
+      await writeFile(release, 'release');
+      await pending;
+    }
+    const [disabled, staged] = await Promise.all([disabling, staging]);
+    const saved = await request<WorkspaceDocument>(route);
+    if (saved.projects.find((project) => project.id === child.id)!.enabled) {
+      expect(disabled.status, await disabled.text()).toBe(409);
+      expect(staged.status, await staged.text()).toBe(200);
+    } else {
+      expect(disabled.status, await disabled.text()).toBe(200);
+      expect(staged.status, await staged.text()).toBe(409);
+      expect(await git(parent, 'rev-parse', ':child')).toBe(oldPointer);
+    }
+  }, 60000);
 
   it('serializes the same index across APIs without blocking linked worktrees', async () => {
     /// @case A slow stage overlaps writes through both APIs and in a linked worktree.
