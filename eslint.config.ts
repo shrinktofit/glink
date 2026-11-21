@@ -8,6 +8,7 @@ export default defineConfig([
   globalIgnores([
     '**/lib/',
     '**/dist/',
+    '**/.pkg/',
     '**/coverage/',
     '**/.local/',
     '**/.turbo/',
@@ -32,7 +33,7 @@ export default defineConfig([
     files: [
       'eslint.config.ts',
       'packages/*/*.config.ts',
-      'packages/server/**/*.ts',
+      'packages/app/**/*.ts',
       'packages/mcp/**/*.ts',
     ],
     extends: [node.configs.recommended],

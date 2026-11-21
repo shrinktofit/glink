@@ -21,6 +21,10 @@ catalog:
 
 autoInstallPeers: false
 
+# Forge requires an explicit pnpm hoisting configuration; this preserves pnpm's default.
+hoistPattern:
+  - '*'
+
 allowBuilds:
   esbuild: true
 

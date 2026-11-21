@@ -10,6 +10,9 @@
   "scripts": {
     "build": "turbo run build",
     "dev": "turbo watch dev",
+    "start": "pnpm --filter @glink/app start",
+    "start:background": "pnpm --filter @glink/app start --background",
+    "pkg": "turbo run pkg --filter=@glink/app",
     "test": "turbo run test",
     "typecheck": "turbo run typecheck && tsc --noEmit",
     "lint": "eslint . --max-warnings=0"

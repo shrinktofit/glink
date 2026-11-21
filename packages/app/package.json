@@ -1,22 +1,31 @@
 {
-  "name": "@glink/server",
+  "name": "@glink/app",
   "version": "0.0.0",
   "private": true,
   "type": "module",
+  "productName": "Glink",
+  "main": "index.ts",
+  "exports": "./index.ts",
   "scripts": {
     "build": "vite build && tsc -b --force",
-    "dev": "node --watch src/main.ts",
-    "start": "node lib/main.js",
+    "dev": "node --run build && node --run start",
+    "start": "electron .",
+    "pkg": "electron-forge package",
     "typecheck": "tsc --noEmit && tsc --project test/tsconfig.json",
     "test": "vitest run"
   },
   "dependencies": {
     "@glink/protocol": "workspace:*",
+    "sirv": "^3.0.2",
     "yaml": "catalog:"
   },
   "devDependencies": {
+    "@electron-forge/cli": "^8.0.1",
+    "@electron-forge/shared-types": "^8.0.1",
+    "@glink/web-app": "workspace:*",
     "@glink/workflow": "workspace:*",
     "@types/node": "catalog:",
+    "electron": "45.4.1",
     "typescript": "catalog:",
     "vite": "catalog:",
     "vitest": "catalog:"

@@ -2,6 +2,7 @@ node_modules/
 .turbo/
 lib/
 dist/
+.pkg/
 coverage/
 *.tsbuildinfo
 *.log
