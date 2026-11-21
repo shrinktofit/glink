@@ -1,13 +1,31 @@
 import { cleanWorktree } from '../src/git/worktree-removal.ts';
 import { execFile } from 'node:child_process';
 import { once } from 'node:events';
-import { mkdir, mkdtemp, readFile, rename, rm, writeFile, symlink, lstat } from 'node:fs/promises';
+import {
+  mkdir,
+  mkdtemp,
+  readFile,
+  rename,
+  rm,
+  writeFile,
+  symlink,
+  lstat,
+  utimes,
+} from 'node:fs/promises';
 import { createServer, type Server } from 'node:http';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { promisify } from 'node:util';
 import process from 'node:process';
-import { GitRevisionKind, type GitReferenceOption } from '@glink/protocol/git';
+import {
+  GitRevisionKind,
+  WorktreePreflightCheck,
+  WorktreePreflightState,
+  type GitReferenceOption,
+  type WorktreeDeletionPlan,
+  type WorktreeDeletionEvent,
+  type WorktreePreflightEvent,
+} from '@glink/protocol/git';
 import { parse } from 'yaml';
 import {
   WorkspaceConnectionKind,
@@ -106,6 +124,28 @@ describe('Workspace HTTP operations in isolated temporary repositories', () => {
       worktreePaths: paths,
       dependencies,
     });
+  }
+
+  async function preflight(worktreePath: string) {
+    const response = await fetch(`${origin}/api/worktree-deletion/preflight`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ worktreePath }),
+    });
+    expect(response.headers.get('content-type')).toContain('application/x-ndjson');
+    return (await response.text()).trim().split('\n')
+      .map((line) => JSON.parse(line) as WorktreePreflightEvent);
+  }
+
+  async function executeDeletion(token: string) {
+    const response = await fetch(`${origin}/api/worktree-deletion/execute`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Accept': 'application/x-ndjson' },
+      body: JSON.stringify({ token }),
+    });
+    expect(response.headers.get('content-type')).toContain('application/x-ndjson');
+    return (await response.text()).trim().split('\n')
+      .map((line) => JSON.parse(line) as WorktreeDeletionEvent);
   }
 
   async function stage(workspace: WorkspaceDocument, projectId: string, path = 'file.txt') {
@@ -407,8 +447,6 @@ describe('Workspace HTTP operations in isolated temporary repositories', () => {
         'in-progress',
         'ok',
         'in-progress',
-        'ok',
-        'in-progress',
         'warn',
       ]);
     expect(events.at(-1)?.plan?.token).toBeTruthy();
@@ -418,6 +456,161 @@ describe('Workspace HTTP operations in isolated temporary repositories', () => {
     expect(events.at(-1)?.error).toContain('其他 worktree');
     expect(events.some((event) => event.plan)).toBe(false);
     expect(await readFile(join(target, 'file.txt'), 'utf8')).toBe('base\n');
+  }, 20000);
+
+  it('streams child-first deletion steps through workspace cleanup', async () => {
+    /// @case A linked checkout has an initialized submodule and a junction to external data.
+    /// @expect Ordered live steps describe both deletions, then record cleanup
+    /// and the final result.
+    const source = await repository('source');
+    const main = await repository('main');
+    await git(main, '-c', 'protocol.file.allow=always', 'submodule', 'add', source, 'child');
+    await git(main, 'commit', '-am', 'Child');
+    const linked = join(directory, 'linked');
+    await git(main, 'worktree', 'add', '-b', 'feature', linked);
+    await git(linked, '-c', 'protocol.file.allow=always', 'submodule', 'update', '--init');
+    const external = join(directory, 'external');
+    await mkdir(external);
+    await writeFile(join(external, 'keep'), 'keep');
+    await symlink(external, join(linked, 'junction'), 'junction');
+    const workspace = await create([linked]);
+    const plan = await request<WorktreeDeletionPlan>(
+      'worktree-deletion/plan', 'POST', { worktreePath: linked },
+    );
+    const events = await executeDeletion(plan.token);
+    const progress = events.flatMap((event) => 'progress' in event ? [event.progress] : []);
+    expect(progress[0]).toMatchObject({ phase: 'queued', completed: 0, total: 2 });
+    expect(progress[1].phase).toBe('revalidate');
+    const deleted = progress.filter((entry) => entry.phase === 'deleted');
+    expect(deleted.map((entry) => entry.worktreePath))
+      .toEqual(plan.worktrees.map((target) => target.path));
+    expect(deleted.map((entry) => entry.completed)).toEqual([1, 2]);
+    for (const target of plan.worktrees) {
+      expect(progress.filter((entry) => entry.worktreePath === target.path)
+        .map((entry) => entry.phase))
+        .toEqual([
+          'scan',
+          'unlink',
+          'clean',
+          'remove',
+          'verify',
+          'deleted',
+        ]);
+    }
+    expect(progress.at(-1)).toMatchObject({ phase: 'records', completed: 2, total: 2 });
+    const last = events.at(-1)!;
+    expect('result' in last).toBe(true);
+    if ('result' in last) {
+      expect(last.result.failed).toBeUndefined();
+      expect(last.result.deleted).toHaveLength(2);
+      expect(last.result.recordErrors).toEqual([]);
+    }
+    expect(await readFile(join(external, 'keep'), 'utf8')).toBe('keep');
+    expect((await request<WorkspaceDocument>(`workspaces/${workspace.id}`)).projects).toEqual([]);
+  }, 40000);
+
+  it('streams revalidation failures without starting deletion', async () => {
+    /// @case HEAD changes after confirmation was prepared.
+    /// @expect Report the validation stage and error, without file-removal steps or false success.
+    const main = await repository('main');
+    const linked = join(directory, 'linked');
+    await git(main, 'worktree', 'add', '-b', 'feature', linked);
+    const plan = await request<WorktreeDeletionPlan>(
+      'worktree-deletion/plan', 'POST', { worktreePath: linked },
+    );
+    await writeFile(join(linked, 'keep'), 'changed after planning');
+    await git(linked, 'add', 'keep');
+    await git(linked, 'commit', '-m', 'New HEAD after planning');
+    const events = await executeDeletion(plan.token);
+    const progress = events.flatMap((event) => 'progress' in event ? [event.progress] : []);
+    expect(progress.map((entry) => entry.phase)).toEqual(['queued', 'revalidate']);
+    expect(events.some((event) => 'result' in event)).toBe(false);
+    const last = events.at(-1)!;
+    expect('error' in last && last.error).toContain('请重新确认');
+    expect(await readFile(join(linked, 'keep'), 'utf8')).toBe('changed after planning');
+  }, 20000);
+
+  it.each([
+    { ref: 'refs/heads/saved', kept: true },
+    { ref: 'refs/tags/saved', kept: true },
+    { ref: 'refs/remotes/origin/saved', kept: true },
+    { ref: 'refs/archive/saved', kept: true },
+    { ref: 'refs/bisect/saved', kept: false },
+    { ref: 'refs/worktree/saved', kept: false },
+    { ref: 'refs/rewritten/saved', kept: false },
+    { ref: undefined, kept: false },
+  ])('checks retained HEAD references: $ref', async ({ ref, kept }) => {
+    /// @case A clean detached checkout has a shared ref, a private ref, or only its HEAD/reflog.
+    /// @expect Only refs surviving deletion suppress the commit-loss warning.
+    const main = await repository('main');
+    const linked = join(directory, 'linked');
+    await git(main, 'worktree', 'add', '--detach', linked, 'HEAD');
+    await writeFile(join(linked, 'file.txt'), 'Unique commit\n');
+    await git(linked, 'commit', '-am', 'Unique');
+    if (ref === 'refs/tags/saved') {
+      await git(linked, 'tag', '-a', 'saved', '-m', 'Saved');
+    } else if (ref) {
+      await git(linked, 'update-ref', ref, 'HEAD');
+    }
+    const events = await preflight(linked);
+    const review = events.flatMap((event) => 'progress' in event ? [event.progress] : [])
+      .filter((progress) => progress.id === WorktreePreflightCheck.review).at(-1);
+    expect(review?.state).toBe(kept ? WorktreePreflightState.ok : WorktreePreflightState.warn);
+    const plan = events.flatMap((event) => 'plan' in event ? [event.plan] : [])[0];
+    expect(plan).toBeDefined();
+    expect(plan.worktrees[0].survivingRefs).toEqual(kept ? [ref] : []);
+  }, 20000);
+
+  it('recognizes HEAD retained through a merge rather than a linear continuation', async () => {
+    /// @case The detached commit is reachable only through a merge on the retained main branch.
+    /// @expect Git ancestry suppresses the warning without needing a ref pointing directly to HEAD.
+    const main = await repository('main');
+    const linked = join(directory, 'linked');
+    await git(main, 'worktree', 'add', '-b', 'topic', linked);
+    await writeFile(join(linked, 'topic.txt'), 'Topic\n');
+    await git(linked, 'add', 'topic.txt');
+    await git(linked, 'commit', '-m', 'Topic');
+    await git(linked, 'checkout', '--detach');
+    await writeFile(join(main, 'main.txt'), 'Main\n');
+    await git(main, 'add', 'main.txt');
+    await git(main, 'commit', '-m', 'Main');
+    await git(main, 'merge', '--no-ff', 'topic', '-m', 'Merge');
+    await git(main, 'branch', '-D', 'topic');
+    const events = await preflight(linked);
+    const review = events.flatMap((event) => 'progress' in event ? [event.progress] : [])
+      .filter((progress) => progress.id === WorktreePreflightCheck.review).at(-1);
+    expect(review?.state).toBe(WorktreePreflightState.ok);
+    const plan = events.flatMap((event) => 'plan' in event ? [event.plan] : [])[0];
+    expect(plan.worktrees[0].survivingRefs).toEqual(['refs/heads/main']);
+  }, 20000);
+
+  it('does not count refs inside a repository that will itself be deleted', async () => {
+    /// @case A detached main checkout has a branch containing HEAD, but its database is deleted.
+    /// @expect That branch is not reported as a surviving reference; repository-loss stays warned.
+    const main = await repository('main');
+    await git(main, 'checkout', '--detach');
+    const events = await preflight(main);
+    const review = events.flatMap((event) => 'progress' in event ? [event.progress] : [])
+      .filter((progress) => progress.id === WorktreePreflightCheck.review).at(-1);
+    expect(review?.state).toBe(WorktreePreflightState.warn);
+    expect(review?.detail).toContain('将删除本地仓库数据');
+    const plan = events.flatMap((event) => 'plan' in event ? [event.plan] : [])[0];
+    expect(plan.worktrees[0].survivingRefs).toEqual([]);
+  }, 20000);
+
+  it('does not report a nonexistent commit as lost in an unborn linked checkout', async () => {
+    /// @case An orphan worktree has no HEAD commit yet and has a clean empty working tree.
+    /// @expect There is no commit-loss warning and no attempt to query a null object ID.
+    const main = await repository('main');
+    const linked = join(directory, 'linked');
+    await git(main, 'worktree', 'add', '--orphan', linked);
+    const events = await preflight(linked);
+    const review = events.flatMap((event) => 'progress' in event ? [event.progress] : [])
+      .filter((progress) => progress.id === WorktreePreflightCheck.review).at(-1);
+    expect(review?.state).toBe(WorktreePreflightState.ok);
+    const plan = events.flatMap((event) => 'plan' in event ? [event.plan] : [])[0];
+    expect(plan.worktrees[0].head).toBeUndefined();
+    expect(plan.worktrees[0].survivingRefs).toEqual([]);
   }, 20000);
 
   it('cleans include paths without following junctions or resetting tracked edits', async () => {
@@ -521,8 +714,8 @@ describe('Workspace HTTP operations in isolated temporary repositories', () => {
     expect((await request<WorkspaceDocument>(`workspaces/${workspace.id}`)).projects).toEqual([]);
   }, 20000);
 
-  it('rejects dependencies, main worktree siblings, and nested repositories', async () => {
-    /// @case Referenced projects, mains with siblings, and nested repositories are targeted.
+  it('rejects incoming dependencies and main worktree siblings', async () => {
+    /// @case A referenced project and a main with another worktree are targeted.
     /// @expect Every rejection precedes cleanup; dirty contents stay intact.
     const main = await repository('main');
     const child = await repository('child');
@@ -532,25 +725,271 @@ describe('Workspace HTTP operations in isolated temporary repositories', () => {
     const linked = join(directory, 'linked');
     await git(main, 'worktree', 'add', '-b', 'feature', linked);
     await request('worktree-deletion/plan', 'POST', { worktreePath: main }, 409);
-    await repository('child/nested');
-    await request('worktree-deletion/plan', 'POST', { worktreePath: child }, 409);
     expect(await readFile(join(child, 'untracked'), 'utf8')).toBe('keep');
   }, 20000);
 
-  it('invalidates a confirmed plan when files or workspace dependencies change', async () => {
-    /// @case A user reviews a deletion plan, then files or another workspace changes.
-    /// @expect An old confirmation cannot authorize the new deletion scope.
+  it.each([false, true])('deletes physical nested repositories (linked: %s)', async (linked) => {
+    /// @case The selected worktree contains an unregistered repository with an external junction.
+    /// @expect Nested contents are included in deletion; the external link target survives.
+    const main = await repository('main');
+    const target = linked ? join(directory, 'linked') : main;
+    if (linked) {
+      await git(main, 'worktree', 'add', '-b', 'feature', target);
+    }
+    const nested = await repository(`${linked ? 'linked' : 'main'}/nested`);
+    const outside = join(directory, 'outside');
+    await mkdir(outside);
+    await writeFile(join(outside, 'keep'), 'external');
+    await symlink(outside, join(nested, 'junction'), 'junction');
+    const plan = await request<WorktreeDeletionPlan>(
+      'worktree-deletion/plan', 'POST', { worktreePath: target },
+    );
+    const result = await request<{ deleted: string[]; failed?: unknown }>(
+      'worktree-deletion/execute', 'POST', { token: plan.token },
+    );
+    expect(result.failed).toBeUndefined();
+    expect(result.deleted).toHaveLength(1);
+    await expect(lstat(target)).rejects.toMatchObject({ code: 'ENOENT' });
+    expect(await readFile(join(outside, 'keep'), 'utf8')).toBe('external');
+    if (linked) {
+      expect(await readFile(join(main, 'file.txt'), 'utf8')).toBe('base\n');
+    }
+  }, 20000);
+
+  it('deletes a linked checkout and its recursive submodules', async () => {
+    /// @case A linked checkout has recursive submodules with externally stored Git data.
+    /// @expect Delete its closure and private metadata; keep the main checkout and source repos.
+    const leaf = await repository('leaf');
+    const source = await repository('source');
+    await git(
+      source,
+      '-c',
+      'protocol.file.allow=always',
+      'submodule',
+      'add',
+      leaf,
+      'vendor/nested',
+    );
+    await git(source, 'commit', '-am', 'Nested submodule');
+    const main = await repository('main');
+    await git(
+      main,
+      '-c',
+      'protocol.file.allow=always',
+      'submodule',
+      'add',
+      source,
+      'external/child',
+    );
+    await git(main, 'commit', '-am', 'Submodule');
+    const linked = join(directory, 'linked');
+    await git(main, 'worktree', 'add', '-b', 'feature', linked);
+    await git(
+      linked,
+      '-c',
+      'protocol.file.allow=always',
+      'submodule',
+      'update',
+      '--init',
+      '--recursive',
+    );
+    const privateGitDir = await git(linked, 'rev-parse', '--absolute-git-dir');
+    const mainHead = await git(main, 'rev-parse', 'HEAD');
+    const workspace = await create([linked]);
+    const plan = await request<WorktreeDeletionPlan>(
+      'worktree-deletion/plan', 'POST', { worktreePath: linked },
+    );
+    expect(plan.worktrees).toHaveLength(3);
+    for (const target of plan.worktrees.filter((worktree) => worktree.main)) {
+      expect(target.survivingRefs).toEqual([]);
+    }
+    const result = await request<{ deleted: string[]; failed?: unknown }>(
+      'worktree-deletion/execute', 'POST', { token: plan.token },
+    );
+    expect(result.failed).toBeUndefined();
+    expect(result.deleted).toHaveLength(3);
+    await expect(lstat(linked)).rejects.toMatchObject({ code: 'ENOENT' });
+    await expect(lstat(privateGitDir)).rejects.toMatchObject({ code: 'ENOENT' });
+    expect(await git(main, 'rev-parse', 'HEAD')).toBe(mainHead);
+    expect(await git(main, 'status', '--porcelain')).toBe('');
+    expect(await git(join(main, 'external', 'child'), 'rev-parse', 'HEAD')).toBe(
+      await git(source, 'rev-parse', 'HEAD'),
+    );
+    expect(await readFile(join(leaf, 'file.txt'), 'utf8')).toBe('base\n');
+    expect(await git(main, 'worktree', 'list', '--porcelain'))
+      .not.toContain(linked.replaceAll('\\', '/'));
+    expect((await request<WorkspaceDocument>(`workspaces/${workspace.id}`)).projects).toEqual([]);
+  }, 40000);
+
+  it.each([false, true])('protects shared submodule data (deinit: %s)', async (deinitialized) => {
+    /// @case A linked checkout's initialized or deinitialized submodule has an external worktree.
+    /// @expect Reject before cleanup and preserve both checkouts and the shared Git database.
+    const source = await repository('source');
+    const main = await repository('main');
+    await git(main, '-c', 'protocol.file.allow=always', 'submodule', 'add', source, 'child');
+    await git(main, 'commit', '-am', 'Submodule');
+    const linked = join(directory, 'linked');
+    await git(main, 'worktree', 'add', '-b', 'feature', linked);
+    await git(linked, '-c', 'protocol.file.allow=always', 'submodule', 'update', '--init');
+    const outside = join(directory, 'outside');
+    await git(join(linked, 'child'), 'worktree', 'add', '-b', 'outside', outside);
+    if (deinitialized) {
+      await git(linked, 'submodule', 'deinit', '-f', '--', 'child');
+    }
+    await writeFile(join(linked, 'keep'), 'keep');
+    await request('worktree-deletion/plan', 'POST', { worktreePath: linked }, 409);
+    expect(await readFile(join(linked, 'keep'), 'utf8')).toBe('keep');
+    expect(await git(outside, 'status', '--porcelain')).toBe('');
+    expect(await git(main, 'status', '--porcelain')).toBe('');
+  }, 30000);
+
+  it('rejects a submodule database outside the owning checkout metadata', async () => {
+    /// @case A linked checkout's submodule is cloned with an unrelated separate Git directory.
+    /// @expect External metadata is not silently added to the deletion scope.
+    const source = await repository('source');
+    const main = await repository('main');
+    await git(main, '-c', 'protocol.file.allow=always', 'submodule', 'add', source, 'child');
+    await git(main, 'commit', '-am', 'Submodule');
+    const linked = join(directory, 'linked');
+    await git(main, 'worktree', 'add', '-b', 'feature', linked);
+    const outsideGitDir = join(directory, 'outside-git');
+    await git(linked, 'clone', '--separate-git-dir', outsideGitDir, source, 'child');
+    await request('worktree-deletion/plan', 'POST', { worktreePath: linked }, 409);
+    expect(await git(join(linked, 'child'), 'rev-parse', 'HEAD')).toBe(
+      await git(source, 'rev-parse', 'HEAD'),
+    );
+    expect((await lstat(outsideGitDir)).isDirectory()).toBe(true);
+  }, 20000);
+
+  it('keeps a deletion plan valid after refreshing the Git index stat cache', async () => {
+    /// @case Git refreshes unchanged tracked-file timestamps in its index after preflight.
+    /// @expect An index cache rewrite does not invalidate the reviewed worktree deletion.
     const target = await repository('target');
-    let plan = await request<{ token: string }>('worktree-deletion/plan', 'POST', {
+    const plan = await request<WorktreeDeletionPlan>('worktree-deletion/plan', 'POST', {
       worktreePath: target,
     });
-    await writeFile(join(target, 'new.txt'), 'keep');
-    await request('worktree-deletion/execute', 'POST', { token: plan.token }, 409);
-    plan = await request('worktree-deletion/plan', 'POST', { worktreePath: target });
+    const indexPath = await git(
+      target, 'rev-parse', '--path-format=absolute', '--git-path', 'index',
+    );
+    const previousIndex = await readFile(indexPath);
+    const nextTime = new Date(Date.now() + 5000);
+    await utimes(join(target, 'file.txt'), nextTime, nextTime);
+    await git(target, 'update-index', '--refresh');
+    expect((await readFile(indexPath)).equals(previousIndex)).toBe(false);
+    const result = await request<{ deleted: string[]; failed?: unknown }>(
+      'worktree-deletion/execute', 'POST', { token: plan.token },
+    );
+    expect(result.failed).toBeUndefined();
+    expect(result.deleted).toHaveLength(1);
+  }, 20000);
+
+  it('includes subsequent file and index edits in the reviewed worktree deletion', async () => {
+    /// @case Tracked, staged, untracked and ignored files change after preflight.
+    /// @expect Whole-worktree deletion includes current contents without a file inventory check.
+    const target = await repository('target');
+    await writeFile(join(target, '.gitignore'), 'ignored/\n');
+    await git(target, 'add', '.gitignore');
+    await git(target, 'commit', '-m', 'Ignore artifacts');
+    const plan = await request<WorktreeDeletionPlan>('worktree-deletion/plan', 'POST', {
+      worktreePath: target,
+    });
+    await writeFile(join(target, 'file.txt'), 'new staged content');
+    await git(target, 'add', 'file.txt');
+    await writeFile(join(target, 'file.txt'), 'new unstaged content');
+    await writeFile(join(target, 'new.txt'), 'new untracked content');
+    await mkdir(join(target, 'ignored'));
+    await writeFile(join(target, 'ignored/artifact'), 'new ignored content');
+    const result = await request<{ deleted: string[]; failed?: unknown }>(
+      'worktree-deletion/execute', 'POST', { token: plan.token },
+    );
+    expect(result.failed).toBeUndefined();
+    expect(result.deleted).toHaveLength(1);
+    await expect(lstat(target)).rejects.toMatchObject({ code: 'ENOENT' });
+  }, 20000);
+
+  it('ignores workspace edits unrelated to the deletion scope', async () => {
+    /// @case Reviewed and unrelated projects are marked settled and an unrelated workspace opens.
+    /// @expect Confirmation stays valid, preserving every surviving project's latest metadata.
+    const target = await repository('target');
     const other = await repository('other');
-    await create([other, target], [{ fromPath: other, toPath: target }]);
+    const workspace = await create([target, other]);
+    const second = await request<WorkspaceDocument>('workspaces', 'POST', {
+      name: 'Also contains target',
+      worktreePaths: [target],
+    });
+    const plan = await request<WorktreeDeletionPlan>('worktree-deletion/plan', 'POST', {
+      worktreePath: target,
+    });
+    for (const project of workspace.projects) {
+      await request(`workspaces/${workspace.id}/projects/${project.id}`, 'PATCH', {
+        ...project,
+        settled: true,
+        dependencyIds: [],
+      });
+    }
+    const unrelated = await request<WorkspaceDocument>('workspaces', 'POST', {
+      name: 'Unrelated',
+      worktreePaths: [other],
+    });
+    const result = await request<{ deleted: string[]; failed?: unknown }>(
+      'worktree-deletion/execute', 'POST', { token: plan.token },
+    );
+    expect(result.failed).toBeUndefined();
+    expect(result.deleted).toHaveLength(1);
+    const remaining = await request<WorkspaceDocument>(`workspaces/${workspace.id}`);
+    expect(remaining.projects).toHaveLength(1);
+    expect(remaining.projects[0]).toMatchObject({ name: 'other', settled: true });
+    expect((await request<WorkspaceDocument>(`workspaces/${second.id}`)).projects).toEqual([]);
+    expect(await request<WorkspaceDocument>(`workspaces/${unrelated.id}`)).toEqual(unrelated);
+    expect(await readFile(join(other, 'file.txt'), 'utf8')).toBe('base\n');
+  }, 30000);
+
+  it.each([false, true])('rechecks new workspace references: dependency %s', async (dependency) => {
+    /// @case An unopened workspace starts referencing the worktree after preflight.
+    /// @expect New removals need confirmation; incoming dependencies block deletion entirely.
+    const target = await repository('target');
+    const plan = await request<WorktreeDeletionPlan>('worktree-deletion/plan', 'POST', {
+      worktreePath: target,
+    });
+    const other = await repository('other');
+    await create([other, target], dependency ? [{ fromPath: other, toPath: target }] : undefined);
     await request('worktree-deletion/execute', 'POST', { token: plan.token }, 409);
-    expect(await readFile(join(target, 'new.txt'), 'utf8')).toBe('keep');
+    expect(await readFile(join(target, 'file.txt'), 'utf8')).toBe('base\n');
+  }, 20000);
+
+  it('requires a new plan when the initialized submodule closure changes', async () => {
+    /// @case A new submodule checkout is initialized after its parent's deletion preflight.
+    /// @expect Changed Git deletion scope is rejected before any checkout is removed.
+    const target = await repository('target');
+    const source = await repository('source');
+    const plan = await request<WorktreeDeletionPlan>('worktree-deletion/plan', 'POST', {
+      worktreePath: target,
+    });
+    await git(target, '-c', 'protocol.file.allow=always', 'submodule', 'add', source, 'child');
+    await request('worktree-deletion/execute', 'POST', { token: plan.token }, 409);
+    expect(await readFile(join(target, 'child/file.txt'), 'utf8')).toBe('base\n');
+    expect(await readFile(join(source, 'file.txt'), 'utf8')).toBe('base\n');
+  }, 20000);
+
+  it('requires confirmation when the last surviving HEAD reference is removed', async () => {
+    /// @case A detached checkout loses its only shared reference after deletion preflight.
+    /// @expect New commit-loss risk blocks deletion even when HEAD and files stay unchanged.
+    const main = await repository('main');
+    const linked = join(directory, 'linked');
+    await git(main, 'worktree', 'add', '--detach', linked, 'HEAD');
+    await writeFile(join(linked, 'file.txt'), 'unique commit\n');
+    await git(linked, 'commit', '-am', 'Unique');
+    await git(linked, 'branch', 'saved');
+    const plan = await request<WorktreeDeletionPlan>('worktree-deletion/plan', 'POST', {
+      worktreePath: linked,
+    });
+    expect(plan.worktrees[0].survivingRefs).toEqual(['refs/heads/saved']);
+    await git(main, 'branch', '-D', 'saved');
+    const refusal = await request<{ error: string }>(
+      'worktree-deletion/execute', 'POST', { token: plan.token }, 409,
+    );
+    expect(refusal.error).toContain('提交保留情况已变化');
+    expect(await readFile(join(linked, 'file.txt'), 'utf8')).toBe('unique commit\n');
   }, 20000);
 
   it('deletes an entire submodule closure and cleans workspace records', async () => {
@@ -574,15 +1013,21 @@ describe('Workspace HTTP operations in isolated temporary repositories', () => {
     expect(await readFile(join(source, 'file.txt'), 'utf8')).toBe('base\n');
   }, 20000);
 
-  async function slowCleanFilter(path: string) {
+  async function slowCleanFilter(path: string, paused = true) {
     const marker = join(directory, 'filter-started');
     const release = join(directory, 'filter-release');
+    const armed = join(directory, 'filter-armed');
+    if (paused) {
+      await writeFile(armed, 'pause');
+    }
     const script = join(directory, 'slow-filter.cjs');
     await writeFile(script, `
       const fs = require('node:fs');
-      fs.writeFileSync(${JSON.stringify(marker)}, String(process.pid));
-      while (!fs.existsSync(${JSON.stringify(release)})) {
-        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10);
+      if (fs.existsSync(${JSON.stringify(armed)})) {
+        fs.writeFileSync(${JSON.stringify(marker)}, String(process.pid));
+        while (!fs.existsSync(${JSON.stringify(release)})) {
+          Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10);
+        }
       }
       process.stdin.pipe(process.stdout);
     `);
@@ -592,8 +1037,46 @@ describe('Workspace HTTP operations in isolated temporary repositories', () => {
     const command = `"${process.execPath.replaceAll('\\', '/')}" "${script.replaceAll('\\', '/')}"`;
     await git(path, 'config', 'filter.glink-test.clean', command);
     await writeFile(join(path, 'file.txt'), 'edit\n');
-    return { marker, release };
+    return { marker, release, armed };
   }
+
+  it('continues accepted deletion when the progress reader disconnects', async () => {
+    /// @case Revalidation is waiting in a Git filter when the user loses the progress connection.
+    /// @expect Progress is already visible; deletion and workspace cleanup finish after disconnect.
+    const main = await repository('main');
+    const linked = join(directory, 'linked');
+    await git(main, 'worktree', 'add', '-b', 'feature', linked, 'HEAD');
+    const { marker, release, armed } = await slowCleanFilter(linked, false);
+    const workspace = await create([linked]);
+    const plan = await request<WorktreeDeletionPlan>('worktree-deletion/plan', 'POST', {
+      worktreePath: linked,
+    });
+    await writeFile(armed, 'pause');
+    const controller = new AbortController();
+    const response = await fetch(`${origin}/api/worktree-deletion/execute`, {
+      method: 'POST',
+      signal: controller.signal,
+      headers: { 'Content-Type': 'application/json', 'Accept': 'application/x-ndjson' },
+      body: JSON.stringify({ token: plan.token }),
+    });
+    const reader = response.body!.getReader();
+    try {
+      const first = await reader.read();
+      expect(new TextDecoder().decode(first.value)).toContain('"phase":"queued"');
+      await expect.poll(async () => readFile(marker, 'utf8').catch(() => '')).not.toBe('');
+      expect((await lstat(linked)).isDirectory()).toBe(true);
+      controller.abort();
+    } finally {
+      controller.abort();
+      reader.releaseLock();
+      await writeFile(release, 'release');
+      await expect.poll(async () => lstat(linked).then(() => true, () => false), {
+        timeout: 10000,
+      }).toBe(false);
+    }
+    expect((await request<WorkspaceDocument>(`workspaces/${workspace.id}`)).projects).toEqual([]);
+    expect(await readFile(join(main, 'file.txt'), 'utf8')).toBe('base\n');
+  }, 30000);
 
   it('serializes disabling a child with queued writes to its parent pointer', async () => {
     /// @case Parent staging holds the index while a child disable and a pointer stage overlap.

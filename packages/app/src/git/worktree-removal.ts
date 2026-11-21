@@ -1,11 +1,21 @@
-import { createHash } from 'node:crypto';
-import { lstat, readdir, readFile, readlink, realpath, unlink, rmdir } from 'node:fs/promises';
+// Electron treats .asar files as virtual directories with fabricated, unstable stats.
+// Worktree scans, cleanup and deletion must use the physical filesystem instead.
+import originalFs from 'original-fs';
 import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import process from 'node:process';
-import type { WorktreeDeletionTarget } from '@glink/protocol/git';
+import { WorktreeDeletionPhase, type WorktreeDeletionTarget } from '@glink/protocol/git';
 import { runGit } from './run-git.ts';
 import { readSubmodulePaths } from './read-changes.ts';
 import { gitIndexPath } from './index-queue.ts';
+
+const {
+  lstat,
+  readdir,
+  readFile,
+  realpath,
+  unlink,
+  rmdir,
+} = originalFs.promises;
 
 export class WorktreeRemovalError extends Error {
   readonly status = 409;
@@ -25,8 +35,6 @@ export interface RemovalTarget extends WorktreeDeletionTarget {
   gitDir: string;
   commonDir: string;
   indexPath: string;
-  inventory: string;
-  topology: string;
 }
 
 async function exists(path: string) {
@@ -40,49 +48,15 @@ async function exists(path: string) {
   }
 }
 
-/** Never traverse a link, including junctions and dangling links. */
-async function inventory(root: string, allowed: Set<string>, signal?: AbortSignal) {
-  const hash = createHash('sha256');
-
-  async function visit(path: string) {
-    signal?.throwIfAborted();
-    const info = await lstat(path);
-    hash.update(JSON.stringify([
-      relative(root, path),
-      info.dev,
-      info.ino,
-      info.mode,
-      info.size,
-      info.mtimeMs,
-    ]));
-    if (info.isSymbolicLink()) {
-      hash.update(await readlink(path));
-    } else if (info.isDirectory()) {
-      if (path !== root && await exists(join(path, '.git')) && !allowed.has(pathIdentity(path))) {
-        throw new WorktreeRemovalError(`存在未纳入删除计划的嵌套仓库：${path}`);
-      }
-      for (const name of (await readdir(path)).sort()) {
-        if (name !== '.git') {
-          await visit(join(path, name));
-        }
-      }
-    }
-  }
-
-  await visit(root);
-  return hash.digest('hex');
-}
-
 /** Inactive submodules retain Git databases too; linked consumers must remain protected. */
-async function inspectStoredSubmodules(directory: string, signal?: AbortSignal): Promise<string> {
+async function inspectStoredSubmodules(directory: string, signal?: AbortSignal): Promise<void> {
   signal?.throwIfAborted();
   const info = await exists(directory);
   if (!info || info.isSymbolicLink() || !info.isDirectory()) {
-    return '';
+    return;
   }
-  let topology = '';
-  if (await exists(join(directory, 'HEAD')) && await exists(join(directory, 'config'))
-    && await exists(join(directory, 'objects'))) {
+  const gitDir = (await runGit(directory, ['rev-parse', '--absolute-git-dir'], { signal })).trim();
+  if (pathIdentity(gitDir) === pathIdentity(directory)) {
     const listing = await runGit(directory, [
       'worktree',
       'list',
@@ -92,17 +66,22 @@ async function inspectStoredSubmodules(directory: string, signal?: AbortSignal):
     if (listing.split('\0\0').filter(Boolean).length > 1) {
       throw new WorktreeRemovalError(`子模块 Git 数据仍被其他 worktree 使用：${directory}`);
     }
-    topology += directory + listing;
-    return topology + await inspectStoredSubmodules(join(directory, 'modules'), signal);
+    const modules = (await runGit(directory, [
+      'rev-parse',
+      '--path-format=absolute',
+      '--git-path',
+      'modules',
+    ], { signal })).trim();
+    await inspectStoredSubmodules(modules, signal);
+    return;
   }
   for (const name of (await readdir(directory)).sort()) {
-    topology += await inspectStoredSubmodules(join(directory, name), signal);
+    await inspectStoredSubmodules(join(directory, name), signal);
   }
-  return topology;
 }
 
 export async function inspectRemoval(
-  worktreePath: string, onFiles?: () => void, signal?: AbortSignal,
+  worktreePath: string, signal?: AbortSignal,
 ): Promise<RemovalTarget[]> {
   signal?.throwIfAborted();
   if (!isAbsolute(worktreePath) || dirname(resolve(worktreePath)) === resolve(worktreePath)) {
@@ -114,8 +93,9 @@ export async function inspectRemoval(
     throw new WorktreeRemovalError('工作树根路径包含符号链接或 junction，不能删除。');
   }
   const targets: RemovalTarget[] = [];
+  const deletionRoots = [root];
 
-  async function inspect(path: string) {
+  async function inspect(path: string, parent?: RemovalTarget) {
     if (pathIdentity(await realpath(path)) !== pathIdentity(path)) {
       throw new WorktreeRemovalError(`子模块路径包含链接：${path}`);
     }
@@ -155,8 +135,19 @@ export async function inspectRemoval(
     if (main && entries.length > 1) {
       throw new WorktreeRemovalError(`主工作树还有其他 worktree，不能删除：${path}`);
     }
-    if (main && !containsPath(root, commonDir)) {
+    const superproject = (await runGit(path, [
+      'rev-parse',
+      '--show-superproject-working-tree',
+    ], { signal })).trim();
+    if (parent && (!superproject || pathIdentity(superproject) !== pathIdentity(parent.path))) {
+      throw new WorktreeRemovalError(`Git 未确认子模块属于当前工作树：${path}`);
+    }
+    if (main && !deletionRoots.some((scope) => containsPath(scope, commonDir))) {
       throw new WorktreeRemovalError(`Git 数据位于删除范围外，不能删除：${commonDir}`);
+    }
+    if (!main) {
+      // Git removes this registered worktree's private data, including its submodules.
+      deletionRoots.push(gitDir);
     }
     const status = await runGit(path, [
       'status',
@@ -166,31 +157,25 @@ export async function inspectRemoval(
       '--untracked-files=all',
       '--ignore-submodules=none',
     ], { signal });
-    const head = own.find((field) => field.startsWith('HEAD '))?.slice(5);
+    const branchOid = status.split('\0').find((line) => line.startsWith('# branch.oid '))
+      ?.slice(13);
+    const head = branchOid === '(initial)' ? undefined : branchOid;
     const branch = own.find((field) => field.startsWith('branch '))?.slice(7);
-    const refs = await runGit(path, [
-      'for-each-ref',
-      '--format=%(refname) %(objectname)',
-    ], { signal });
     const indexPath = await gitIndexPath(path, signal);
-    let index = '';
-    if (await exists(indexPath)) {
-      index = createHash('sha256').update(await readFile(indexPath)).digest('hex');
-    }
-    targets.push({
+    const target: RemovalTarget = {
       path,
       gitDir,
       commonDir,
       main,
       indexPath,
       head,
+      survivingRefs: [],
       branch,
       detached: own.includes('detached'),
       changes: status.split('\0').some((line) =>
         !!line && !line.startsWith('# ')),
-      inventory: '',
-      topology: listing + status + refs + index,
-    });
+    };
+    targets.push(target);
     for (const sub of await readSubmodulePaths(path, signal)) {
       const child = resolve(path, sub);
       if (!containsPath(path, child) || child === path) {
@@ -200,18 +185,32 @@ export async function inspectRemoval(
       if (!info || info.isSymbolicLink() || !await exists(join(child, '.git'))) {
         continue;
       }
-      await inspect(child);
+      await inspect(child, target);
     }
   }
 
   await inspect(root);
-  const allowed = new Set(targets.map((target) => pathIdentity(target.path)));
   for (const target of targets) {
-    target.topology += await inspectStoredSubmodules(join(target.gitDir, 'modules'), signal);
-  }
-  onFiles?.();
-  for (const target of targets) {
-    target.inventory = await inventory(target.path, allowed, signal);
+    const databaseDeleted = deletionRoots.some((scope) => containsPath(scope, target.commonDir));
+    if (target.head && !databaseDeleted) {
+      const containingRefs = await runGit(target.path, [
+        'for-each-ref',
+        `--contains=${target.head}`,
+        '--format=%(refname)',
+        // Git documents these namespaces as private to the worktree being deleted.
+        '--exclude=refs/bisect/*',
+        '--exclude=refs/worktree/*',
+        '--exclude=refs/rewritten/*',
+      ], { signal });
+      target.survivingRefs = containingRefs.trim().split(/\r?\n/).filter(Boolean);
+    }
+    const modules = (await runGit(target.path, [
+      'rev-parse',
+      '--path-format=absolute',
+      '--git-path',
+      'modules',
+    ], { signal })).trim();
+    await inspectStoredSubmodules(modules, signal);
   }
   return targets.reverse();
 }
@@ -231,7 +230,12 @@ async function removeTree(path: string): Promise<void> {
 }
 
 /** Includes are literal root-relative paths, one per line; directories keep their subtree. */
-export async function cleanWorktree(worktreePath: string, keepWorktreeIncludes: boolean) {
+export async function cleanWorktree(
+  worktreePath: string,
+  keepWorktreeIncludes: boolean,
+  onPhase?: (phase: WorktreeDeletionPhase) => void,
+) {
+  onPhase?.(WorktreeDeletionPhase.scan);
   const root = resolve(worktreePath);
   if (!isAbsolute(worktreePath) || dirname(root) === root
     || (await lstat(root)).isSymbolicLink()
@@ -240,27 +244,6 @@ export async function cleanWorktree(worktreePath: string, keepWorktreeIncludes: 
     !== pathIdentity(root)) {
     throw new WorktreeRemovalError('必须选择不包含链接的工作树根目录。');
   }
-  const allowed = new Set([pathIdentity(root)]);
-
-  async function collect(path: string): Promise<void> {
-    if (pathIdentity(await realpath(path)) !== pathIdentity(path)) {
-      throw new WorktreeRemovalError(`子模块路径包含链接：${path}`);
-    }
-    for (const sub of await readSubmodulePaths(path)) {
-      const child = resolve(path, sub);
-      if (!containsPath(path, child) || child === path) {
-        throw new WorktreeRemovalError(`子模块路径越界：${child}`);
-      }
-      const info = await exists(child);
-      if (info && !info.isSymbolicLink() && await exists(join(child, '.git'))) {
-        allowed.add(pathIdentity(child));
-        await collect(child);
-      }
-    }
-  }
-
-  await collect(root);
-  await inventory(root, allowed);
   const include = join(root, '.worktreeinclude');
   const kept: string[] = [];
   if (keepWorktreeIncludes && await exists(include)) {
@@ -303,6 +286,7 @@ export async function cleanWorktree(worktreePath: string, keepWorktreeIncludes: 
   }
 
   await removeLinks(root);
+  onPhase?.(WorktreeDeletionPhase.unlink);
   for (const path of links) {
     await unlink(path);
   }
@@ -311,6 +295,7 @@ export async function cleanWorktree(worktreePath: string, keepWorktreeIncludes: 
     const name = relative(root, path).replaceAll('\\', '/').replace(/[\\*?[\]#! ]/g, '\\$&');
     return ['-e', `/${name}`];
   });
+  onPhase?.(WorktreeDeletionPhase.clean);
   await runGit(root, [
     'clean',
     '-x',
@@ -322,8 +307,11 @@ export async function cleanWorktree(worktreePath: string, keepWorktreeIncludes: 
 }
 
 /** The caller has preflighted the whole closure and holds its index reservations. */
-export async function deleteWorktree(target: RemovalTarget) {
-  await cleanWorktree(target.path, false);
+export async function deleteWorktree(
+  target: RemovalTarget, onPhase?: (phase: WorktreeDeletionPhase) => void,
+) {
+  await cleanWorktree(target.path, false, onPhase);
+  onPhase?.(WorktreeDeletionPhase.remove);
   if (target.main) {
     await removeTree(target.path);
   } else {
@@ -336,6 +324,7 @@ export async function deleteWorktree(target: RemovalTarget) {
       target.path,
     ]);
   }
+  onPhase?.(WorktreeDeletionPhase.verify);
   if (await exists(target.path)) {
     throw new WorktreeRemovalError(`工作树目录仍然存在：${target.path}`);
   }

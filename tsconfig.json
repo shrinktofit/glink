@@ -3,9 +3,7 @@
   "include": [
     "eslint.config.ts",
     "packages/app/index.ts",
-    "packages/*/forge.config.ts",
-    "packages/*/vite.config.ts",
-    "packages/*/vitest.config.ts"
+    "packages/*/*.config.ts"
   ],
   "compilerOptions": {
     "rootDir": ".",

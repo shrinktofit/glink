@@ -25,7 +25,12 @@ export default defineConfig({
     outDir: 'lib',
     sourcemap: true,
     rollupOptions: {
-      external: ['electron', ...builtinModules, /^node:/],
+      external: [
+        'electron',
+        'original-fs',
+        ...builtinModules,
+        /^node:/,
+      ],
     },
   },
 });

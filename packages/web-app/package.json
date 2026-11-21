@@ -6,7 +6,7 @@
   "scripts": {
     "build": "vue-tsc --noEmit && vite build",
     "dev": "vite",
-    "typecheck": "vue-tsc --noEmit && tsc --project test/tsconfig.json",
+    "typecheck": "vue-tsc --noEmit && vue-tsc --noEmit --project test/tsconfig.json",
     "test": "vitest run"
   },
   "dependencies": {
@@ -23,6 +23,8 @@
     "@glink/workflow": "workspace:*",
     "@types/node": "catalog:",
     "@vitejs/plugin-vue": "catalog:",
+    "@vue/test-utils": "^2.6.0",
+    "happy-dom": "^21.0.4",
     "less": "catalog:",
     "typescript": "catalog:",
     "vite": "catalog:",

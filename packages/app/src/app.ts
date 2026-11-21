@@ -1,16 +1,18 @@
 import { app, BrowserWindow, dialog, Menu, nativeImage, screen, shell, Tray } from 'electron';
 import { GlinkServer, type GlinkServerOptions } from './server.ts';
+import { openDevToolsChannel } from '@glink/protocol/window-controls';
 
 export interface AppOptions extends GlinkServerOptions {
   background: boolean;
   iconPath: string;
+  preloadPath: string;
 }
 
 /** Owns the single service instance, tray and optional browser window. */
 export class App {
   static async start(options: AppOptions) {
     const server = await GlinkServer.start(options);
-    const application = new App(server, options.iconPath);
+    const application = new App(server, options.iconPath, options.preloadPath);
     if (!options.background) {
       await application.showWindow();
     }
@@ -34,12 +36,20 @@ export class App {
         icon: this._iconPath,
         backgroundColor: '#f5f6f8',
         webPreferences: {
+          preload: this._preloadPath,
           nodeIntegration: false,
           contextIsolation: true,
           sandbox: true,
         },
       });
       this._window = window;
+      window.webContents.ipc.handle(openDevToolsChannel, (event) => {
+        if (event.senderFrame !== window.webContents.mainFrame
+          || event.senderFrame.origin !== new URL(this._server.url).origin) {
+          throw new Error('Window commands require the Glink main frame.');
+        }
+        window.webContents.openDevTools();
+      });
       window.on('close', (event) => {
         if (!this._quitting) {
           event.preventDefault();
@@ -75,9 +85,10 @@ export class App {
     this._window.focus();
   }
 
-  private constructor(server: GlinkServer, iconPath: string) {
+  private constructor(server: GlinkServer, iconPath: string, preloadPath: string) {
     this._server = server;
     this._iconPath = iconPath;
+    this._preloadPath = preloadPath;
     const icon = nativeImage.createFromPath(iconPath);
     if (icon.isEmpty()) {
       throw new Error(`Glink tray icon could not be loaded: ${iconPath}`);
@@ -109,6 +120,7 @@ export class App {
 
   private readonly _server: GlinkServer;
   private readonly _iconPath: string;
+  private readonly _preloadPath: string;
   private readonly _tray: Tray;
   private _window?: BrowserWindow;
   private _windowReady?: Promise<void>;

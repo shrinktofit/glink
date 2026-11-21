@@ -122,6 +122,17 @@ const staleMetadataIds = new Set<string>();
 let structureDirty = false;
 
 watch(projectIds, (ids, previous) => {
+  const existing = new Set(ids);
+  statuses.value = statuses.value.filter((status) => existing.has(status.projectId));
+  commits.value = commits.value.filter((commit) => existing.has(commit.projectId));
+  historyErrors.value = historyErrors.value.filter((entry) => existing.has(entry.projectId));
+  for (const pending of [pendingStatusIds, staleMetadataIds]) {
+    for (const id of pending) {
+      if (!existing.has(id)) {
+        pending.delete(id);
+      }
+    }
+  }
   const remaining = selectedProjectIds.value.filter((id) => ids.includes(id));
   if (remaining.length !== selectedProjectIds.value.length) {
     selectedProjectIds.value = remaining.length ? remaining : ids.slice(0, 1);
@@ -323,7 +334,7 @@ async function refresh() {
   loading.value = true;
   error.value = '';
   try {
-    const document = await service.get(workspace.value.id);
+    const document = await service.get(workspace.value.id, controller.signal);
     if (controller.signal.aborted) {
       return;
     }
@@ -557,6 +568,11 @@ async function commit(projectIds: string[], message: string, amend: boolean) {
     busy.value = false;
   }
 }
+
+// Deletion invalidates workspace data without changing the current route or page instance.
+watch(app.deletionVersion, () => {
+  void refresh();
+});
 
 const focusController = new AbortController();
 onMounted(() => {

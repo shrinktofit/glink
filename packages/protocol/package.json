@@ -7,7 +7,8 @@
     "./health": "./lib/health.js",
     "./git": "./lib/git.js",
     "./workspace": "./lib/workspace.js",
-    "./tools": "./lib/tools.js"
+    "./tools": "./lib/tools.js",
+    "./window-controls": "./lib/window-controls.js"
   },
   "scripts": {
     "build": "vite build && tsc -b --force",

@@ -2,6 +2,8 @@ import {
   worktreeDeletionPath,
   type WorktreeDeletionPlan,
   type WorktreeDeletionResult,
+  type WorktreeDeletionEvent,
+  type WorktreeDeletionProgress,
   type WorktreePreflightEvent,
   type WorktreePreflightProgress,
 } from '@glink/protocol/git';
@@ -44,46 +46,52 @@ export class WorkspaceService {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ worktreePath }),
     });
-    if (!response.ok) {
-      throw new Error((await response.json() as { error: string }).error);
-    }
-    const reader = response.body!.getReader();
-    const decoder = new TextDecoder();
-    let buffer = '';
+    const interrupted = '预检连接提前结束，请重新检查。';
     let plan: WorktreeDeletionPlan | undefined;
-    try {
-      while (true) {
-        const { value, done } = await reader.read();
-        buffer += decoder.decode(value, { stream: !done });
-        let newline: number;
-        while ((newline = buffer.indexOf('\n')) >= 0) {
-          const event = JSON.parse(buffer.slice(0, newline)) as WorktreePreflightEvent;
-          buffer = buffer.slice(newline + 1);
-          if ('progress' in event) {
-            onProgress(event.progress);
-          } else if ('plan' in event) {
-            plan = event.plan;
-          } else {
-            throw new Error(event.error);
-          }
-        }
-        if (done) {
-          break;
-        }
+    for await (const event of WorkspaceService._readEvents<WorktreePreflightEvent>(
+      response, interrupted,
+    )) {
+      if ('progress' in event) {
+        onProgress(event.progress);
+      } else if ('plan' in event) {
+        plan = event.plan;
+      } else {
+        throw new Error(event.error);
       }
-    } finally {
-      reader.releaseLock();
     }
-    if (!plan || buffer.trim()) {
-      throw new Error('预检连接提前结束，请重新检查。');
+    if (!plan) {
+      throw new Error(interrupted);
     }
     return plan;
   }
 
-  deleteWorktree(token: string) {
-    return WorkspaceService._request<WorktreeDeletionResult>(
-      `${worktreeDeletionPath}/execute`, 'POST', { token },
-    );
+  async deleteWorktree(
+    token: string, onProgress: (progress: WorktreeDeletionProgress) => void,
+  ): Promise<WorktreeDeletionResult> {
+    const interrupted = '删除进度连接已中断，结果未知。请检查工作树和工作区状态后重新预检，勿直接重复删除。';
+    const response = await fetch(`${worktreeDeletionPath}/execute`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Accept': 'application/x-ndjson' },
+      body: JSON.stringify({ token }),
+    }).catch((cause: unknown) => {
+      throw new Error(interrupted, { cause });
+    });
+    let result: WorktreeDeletionResult | undefined;
+    for await (const event of WorkspaceService._readEvents<WorktreeDeletionEvent>(
+      response, interrupted,
+    )) {
+      if ('progress' in event) {
+        onProgress(event.progress);
+      } else if ('result' in event) {
+        result = event.result;
+      } else {
+        throw new Error(event.error);
+      }
+    }
+    if (!result) {
+      throw new Error(interrupted);
+    }
+    return result;
   }
 
   retryDeletionRecordCleanup(token: string) {
@@ -215,6 +223,37 @@ export class WorkspaceService {
 
   commit(id: string, input: WorkspaceCommitInput) {
     return this._request<WorkspaceCommitResult>(id, '/commit', 'POST', input);
+  }
+
+  private static async* _readEvents<T>(response: Response, interrupted: string) {
+    if (!response.ok) {
+      throw new Error((await response.json() as { error: string }).error);
+    }
+    const reader = response.body!.getReader();
+    const decoder = new TextDecoder();
+    let buffer = '';
+    try {
+      while (true) {
+        const { value, done } = await reader.read();
+        buffer += decoder.decode(value, { stream: !done });
+        let newline: number;
+        while ((newline = buffer.indexOf('\n')) >= 0) {
+          const event = JSON.parse(buffer.slice(0, newline)) as T;
+          buffer = buffer.slice(newline + 1);
+          yield event;
+        }
+        if (done) {
+          break;
+        }
+      }
+    } catch (cause: unknown) {
+      throw new Error(interrupted, { cause });
+    } finally {
+      reader.releaseLock();
+    }
+    if (buffer.trim()) {
+      throw new Error(interrupted);
+    }
   }
 
   private static async _request<T>(

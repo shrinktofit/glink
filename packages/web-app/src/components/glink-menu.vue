@@ -3,9 +3,21 @@ import { inject, ref } from 'vue';
 import { RouterLink, useRoute } from 'vue-router';
 import { RouteName } from '../router';
 import { appKey } from '../app-context';
+import type { WindowControls } from '../native-window';
 const open = ref(false);
 const app = inject(appKey)!;
 const route = useRoute();
+const nativeWindow: WindowControls | undefined = window.glinkWindow;
+
+function reloadWindow() {
+  open.value = false;
+  window.location.reload();
+}
+
+async function openDevTools() {
+  open.value = false;
+  await nativeWindow!.openDevTools();
+}
 </script>
 <template>
   <div
@@ -65,6 +77,20 @@ const route = useRoute();
         >
           仓库浏览
         </router-link>
+        <hr role="separator">
+        <button
+          role="menuitem"
+          @click="reloadWindow"
+        >
+          重载窗口
+        </button>
+        <button
+          v-if="nativeWindow"
+          role="menuitem"
+          @click="openDevTools"
+        >
+          打开开发者工具
+        </button>
       </div>
     </template>
   </div>

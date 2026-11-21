@@ -5,10 +5,11 @@ export default defineConfig({
     target: 'es2022',
     lib: {
       entry: {
-        health: 'src/health.ts',
-        git: 'src/git.ts',
-        workspace: 'src/workspace.ts',
-        tools: 'src/tools.ts',
+        'health': 'src/health.ts',
+        'git': 'src/git.ts',
+        'workspace': 'src/workspace.ts',
+        'tools': 'src/tools.ts',
+        'window-controls': 'src/window-controls.ts',
       },
       formats: ['es'],
       fileName: (_format, entryName) => `${entryName}.js`,

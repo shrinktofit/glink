@@ -32,6 +32,7 @@ try {
         glinkHome: join(homedir(), '.glink'),
         webRoot: join(app.getAppPath(), 'lib/web'),
         iconPath: join(app.getAppPath(), 'assets/icon.png'),
+        preloadPath: join(app.getAppPath(), 'lib/preload.cjs'),
       });
     });
     app.on('second-instance', (_event, argv) => {

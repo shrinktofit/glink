@@ -1,15 +1,18 @@
 import {
   WorktreePreflightCheck,
   WorktreePreflightState,
+  WorktreeDeletionPhase,
+  type WorktreeDeletionProgress,
   type WorktreePreflightProgress,
 } from '@glink/protocol/git';
-import { createHash, randomUUID } from 'node:crypto';
+import { randomUUID } from 'node:crypto';
 import type { WorktreeDeletionPlan, WorktreeDeletionResult } from '@glink/protocol/git';
 import type { WorkspaceDocument } from '@glink/protocol/workspace';
 import {
   containsPath,
   deleteWorktree,
   inspectRemoval,
+  pathIdentity,
   WorktreeRemovalError,
   type RemovalTarget,
 } from '../git/worktree-removal.ts';
@@ -19,7 +22,6 @@ import { WorkspaceStore } from './workspace-store.ts';
 interface PreparedDeletion {
   plan: WorktreeDeletionPlan;
   targets: RemovalTarget[];
-  signature: string;
 }
 
 export class WorktreeDeletionService {
@@ -57,17 +59,60 @@ export class WorktreeDeletionService {
     }
   }
 
-  async safeDeleteWorktree(token: string): Promise<WorktreeDeletionResult> {
+  async safeDeleteWorktree(
+    token: string, onProgress?: (progress: WorktreeDeletionProgress) => void,
+  ): Promise<WorktreeDeletionResult> {
     const prepared = this._plans.get(token);
     if (!prepared) {
       throw new WorktreeRemovalError('删除计划已失效，请重新确认。');
     }
     this._plans.delete(token);
+    let completed = 0;
+    const report = (phase: WorktreeDeletionPhase, worktreePath?: string, detail?: string) => {
+      onProgress?.({
+        phase,
+        worktreePath,
+        detail,
+        completed,
+        total: prepared.targets.length,
+      });
+    };
+    report(WorktreeDeletionPhase.queued);
     return this._store.mutate(() => withGitIndices(
       prepared.targets.map((target) => target.indexPath), async () => {
+        report(WorktreeDeletionPhase.revalidate);
         const current = await this._prepare(prepared.plan.worktreePath);
-        if (current.signature !== prepared.signature) {
-          throw new WorktreeRemovalError('删除范围、文件或工作区状态已变化，请重新确认。');
+        const sameScope = current.targets.length === prepared.targets.length
+          && current.targets.every((target, index) => {
+            const previous = prepared.targets[index];
+            return target.main === previous.main
+              && ([
+                'path',
+                'gitDir',
+                'commonDir',
+                'indexPath',
+              ] as const).every((key) =>
+                pathIdentity(target[key]) === pathIdentity(previous[key]));
+          });
+        if (!sameScope) {
+          throw new WorktreeRemovalError('工作树或 Git 数据的删除范围已变化，请重新确认。');
+        }
+        if (current.targets.some((target, index) => {
+          const previous = prepared.targets[index];
+          return target.head !== previous.head
+            || (previous.survivingRefs.length > 0 && target.survivingRefs.length === 0);
+        })) {
+          throw new WorktreeRemovalError('工作树 HEAD 或提交保留情况已变化，请重新确认。');
+        }
+        const references = current.plan.references;
+        if (references.length !== prepared.plan.references.length
+          || references.some((reference, index) => {
+            const previous = prepared.plan.references[index];
+            return reference.workspaceId !== previous.workspaceId
+              || reference.projectId !== previous.projectId
+              || pathIdentity(reference.worktreePath) !== pathIdentity(previous.worktreePath);
+          })) {
+          throw new WorktreeRemovalError('引用此删除范围的工作区项目已变化，请重新确认。');
         }
         const result: WorktreeDeletionResult = {
           deleted: [],
@@ -76,14 +121,18 @@ export class WorktreeDeletionService {
         };
         for (const target of current.targets) {
           try {
-            await deleteWorktree(target);
+            await deleteWorktree(target, (phase) => report(phase, target.path));
             result.deleted.push(target.path);
             result.remaining.shift();
+            completed++;
+            report(WorktreeDeletionPhase.deleted, target.path);
           } catch (error: unknown) {
             result.failed = { path: target.path, error: String(error) };
+            report(WorktreeDeletionPhase.failed, target.path, result.failed.error);
             break;
           }
         }
+        report(WorktreeDeletionPhase.records);
         result.recordErrors = await this._forget(result.deleted);
         if (result.recordErrors.length) {
           const cleanupToken = randomUUID();
@@ -117,14 +166,11 @@ export class WorktreeDeletionService {
     path: string, report?: (progress: WorktreePreflightProgress) => void, signal?: AbortSignal,
   ): Promise<PreparedDeletion> {
     report?.({ id: WorktreePreflightCheck.topology, state: WorktreePreflightState.inProgress });
-    const targets = await inspectRemoval(path, () => {
-      report?.({ id: WorktreePreflightCheck.topology, state: WorktreePreflightState.ok });
-      report?.({ id: WorktreePreflightCheck.files, state: WorktreePreflightState.inProgress });
-    }, signal);
+    const targets = await inspectRemoval(path, signal);
     if (targets.some((target) => containsPath(target.path, this._store.home))) {
       throw new WorktreeRemovalError('删除范围包含 Glink Home，不能删除。');
     }
-    report?.({ id: WorktreePreflightCheck.files, state: WorktreePreflightState.ok });
+    report?.({ id: WorktreePreflightCheck.topology, state: WorktreePreflightState.ok });
     report?.({ id: WorktreePreflightCheck.references, state: WorktreePreflightState.inProgress });
     const catalog = await this._store.catalog();
     const documents: WorkspaceDocument[] = [];
@@ -142,7 +188,8 @@ export class WorktreeDeletionService {
           const parent = this._store.project(document, edge.from);
           const child = this._store.project(document, edge.to);
           throw new WorktreeRemovalError(
-            `${document.name} / ${parent.name} 仍依赖 ${child.name}，不能删除工作树。`,
+            `工作区「${document.name}」中的项目「${parent.name}」`
+            + `仍依赖项目「${child.name}」，不能删除工作树。`,
           );
         }
       }
@@ -156,22 +203,23 @@ export class WorktreeDeletionService {
         });
       }
     }
+    // Saving any workspace can reorder the catalog without changing deletion authorization.
+    references.sort((a, b) => a.workspaceId.localeCompare(b.workspaceId)
+      || a.projectId.localeCompare(b.projectId));
     report?.({ id: WorktreePreflightCheck.references, state: WorktreePreflightState.ok });
     report?.({ id: WorktreePreflightCheck.review, state: WorktreePreflightState.inProgress });
     const warnings = targets.flatMap((target) => [
       ...(target.main ? [`${target.path}：将删除本地仓库数据。`] : []),
       ...(target.changes ? [`${target.path}：存在未提交或未跟踪的修改。`] : []),
-      ...(target.detached ? [`${target.path}：Detached HEAD 提交可能失去持久引用。`] : []),
+      ...(!target.main && target.head && !target.survivingRefs.length
+        ? [`${target.path}：当前提交没有删除后仍保留的引用，可能丢失。`]
+        : []),
     ]);
     report?.({ id: WorktreePreflightCheck.review,
       state: warnings.length ? WorktreePreflightState.warn : WorktreePreflightState.ok,
       detail: warnings.length ? warnings.join('\n') : undefined });
-    // The whole catalog participates: an unopened workspace can introduce a new incoming edge.
-    const signature = createHash('sha256')
-      .update(JSON.stringify({ targets, documents })).digest('hex');
     return {
       targets,
-      signature,
       plan: {
         token: '',
         worktreePath: path,
@@ -180,6 +228,7 @@ export class WorktreeDeletionService {
           main,
           branch,
           head,
+          survivingRefs,
           detached,
           changes,
         }) =>
@@ -188,6 +237,7 @@ export class WorktreeDeletionService {
             main,
             branch,
             head,
+            survivingRefs,
             detached,
             changes,
           })),

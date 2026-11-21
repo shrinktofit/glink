@@ -2,7 +2,11 @@ import { toolsPath } from '@glink/protocol/tools';
 import { executeWorkspaceTool } from '../tools/workspace-tools.ts';
 import { WorktreeDeletionService } from './worktree-deletion-service.ts';
 import { WorktreeRemovalError } from '../git/worktree-removal.ts';
-import { worktreeDeletionPath, type WorktreePreflightEvent } from '@glink/protocol/git';
+import {
+  worktreeDeletionPath,
+  type WorktreePreflightEvent,
+  type WorktreeDeletionEvent,
+} from '@glink/protocol/git';
 import { readRequestSignal } from '../read-request-signal.ts';
 import { Buffer } from 'node:buffer';
 import type { IncomingMessage, ServerResponse } from 'node:http';
@@ -126,6 +130,31 @@ export async function createGlinkRequestHandler(options: { glinkHome: string }) 
         if (!cancellation.aborted) {
           send({ error: String(error) });
         }
+      }
+      response.end();
+      return;
+    }
+    if (url.pathname === `${worktreeDeletionPath}/execute` && method === 'POST'
+      && request.headers.accept?.includes('application/x-ndjson')) {
+      const input = await body<{ token: string }>(request);
+      response.writeHead(200, {
+        'Content-Type': 'application/x-ndjson; charset=utf-8',
+        'Cache-Control': 'no-cache, no-transform',
+        'X-Accel-Buffering': 'no',
+      });
+      response.flushHeaders();
+      const send = (event: WorktreeDeletionEvent) => {
+        if (!response.destroyed && !response.writableEnded) {
+          response.write(JSON.stringify(event) + '\n');
+        }
+      };
+      try {
+        // Disconnecting the progress stream must not cancel an accepted deletion.
+        const result = await deletion.safeDeleteWorktree(input.token,
+          (progress) => send({ progress }));
+        send({ result });
+      } catch (error: unknown) {
+        send({ error: error instanceof Error ? error.message : String(error) });
       }
       response.end();
       return;
